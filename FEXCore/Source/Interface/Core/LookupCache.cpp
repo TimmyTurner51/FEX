@@ -63,11 +63,14 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
 
   if (DynamicL1Cache()) {
     // Start at minimum size when dynamic.
-    L1PointerMask = MIN_L1_ENTRIES - 1;
+    CurrentL1Entries = MIN_L1_ENTRIES;
   } else {
     // Start at maximum instead.
-    L1PointerMask = MAX_L1_ENTRIES - 1;
+    CurrentL1Entries = MAX_L1_ENTRIES;
   }
+  // Keep CurrentL1Entries in sync with L1PointerMask: InvalidateCache masks by L1PointerMask
+  // while InvalidateUntrackedRange sweeps [0, CurrentL1Entries).
+  L1PointerMask = CurrentL1Entries - 1;
 }
 
 LookupCache::~LookupCache() {

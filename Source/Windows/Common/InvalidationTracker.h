@@ -32,6 +32,9 @@ public:
   };
   InvalidateContainingSectionResult InvalidateContainingSection(uint64_t Address, bool Free);
   void InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free);
+  // Drops one block from every code buffer and thread cache. Only valid when every block compiled
+  // from writable code validates its own bytes on entry (SMCChecks=full).
+  void InvalidateGuestBlock(uint64_t Entry);
   void ReprotectRWXIntervals(uint64_t Address, uint64_t Size);
   bool HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t FaultAddress);
 

@@ -1045,20 +1045,22 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
   return (uintptr_t)CodePtr;
 }
 
-void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
+bool ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
   FEXCORE_PROFILE_SCOPED("InvalidateCodeBuffersCodeRange");
 
   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+  bool HadCode = false;
   std::scoped_lock lk {CodeBufferListLock};
   auto it = CodeBufferList.begin();
   while (it != CodeBufferList.end()) {
     if (auto Strong = it->lock()) {
-      Strong->LookupCache->InvalidateRange(Start, Length);
+      HadCode |= Strong->LookupCache->InvalidateRange(Start, Length);
       it++;
     } else {
       it = CodeBufferList.erase(it);
     }
   }
+  return HadCode;
 }
 
 void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
@@ -1076,8 +1078,41 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
   }
 }
 
+void ContextImpl::InvalidateCodeBuffersBlock(uint64_t Entry) {
+  std::scoped_lock lk {CodeBufferListLock};
+  for (const auto& Weak : CodeBufferList) {
+    if (auto Strong = Weak.lock()) {
+      auto MapLock = Strong->LookupCache->AcquireWriteLock();
+      Strong->LookupCache->Erase(Entry, MapLock);
+    }
+  }
+}
+
+void ContextImpl::InvalidateThreadCachedBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Entry) {
+  LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+  Thread->LookupCache->InvalidateCachedBlock(Entry);
+}
+
+void ContextImpl::InvalidateThreadUntrackedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
+  std::scoped_lock Lock {CodeInvalidationMutex};
+  Thread->FrontendDecoder->ResetExecutableRangeCache();
+  Thread->LookupCache->InvalidateUntrackedRange(Start, Length);
+}
+
 void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
-  static_cast<ContextImpl*>(Frame->Thread->CTX)->SyscallHandler->InvalidateGuestCodeRange(Frame->Thread, GuestRIP, 1);
+  auto Thread = Frame->Thread;
+  auto CTX = static_cast<ContextImpl*>(Thread->CTX);
+
+  if (CTX->Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL) {
+    // Every block compiled from writable code validates its own bytes on entry, so a thread that
+    // reaches a stale copy through its own cache, an older buffer's links, or a racing link detects
+    // the mismatch itself and erases it from the map it looks up in. Drop only this thread's block.
+    Thread->LookupCache->InvalidateBlock(GuestRIP);
+    return;
+  }
+
+  Thread->LookupCache->InvalidateBlock(GuestRIP);
+  CTX->SyscallHandler->InvalidateGuestBlock(Thread, GuestRIP);
 }
 
 std::optional<CustomIRResult>
