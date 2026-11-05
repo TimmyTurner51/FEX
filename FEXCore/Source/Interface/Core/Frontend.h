@@ -55,6 +55,8 @@ public:
   struct DecodedBlockInformation final {
     uint64_t TotalInstructionCount;
     bool Is64BitMode {};
+    // Set if any decoded byte came from a range that was writable while decoding.
+    bool ContainsWritableCode {};
     fextl::vector<DecodedBlocks> Blocks;
     fextl::set<uint64_t> EntryPoints;
     fextl::set<uint64_t> CodePages; // Start addresses of all pages touching the block

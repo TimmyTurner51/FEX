@@ -103,6 +103,7 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
     if (RangeInfo.Size == 0) {
       return false;
     }
+    BlockInfo.ContainsWritableCode |= RangeInfo.Writable;
 
     uint64_t RangeRemainingSize = ExecutableRangeEnd - Address;
     if (Size > RangeRemainingSize) {
@@ -111,6 +112,7 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
     }
   }
 
+  BlockInfo.ContainsWritableCode |= ExecutableRangeWritable;
   return true;
 }
 
@@ -1741,6 +1743,7 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
 void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst) {
   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
   BlockInfo.TotalInstructionCount = 0;
+  BlockInfo.ContainsWritableCode = false;
   BlockInfo.Blocks.clear();
   VisitedBlocks.clear();
   // Reset internal state management

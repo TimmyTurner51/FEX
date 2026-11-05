@@ -601,6 +601,44 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
       }
 
       uint64_t BlockInstructionsLength {};
+
+      // One CRC of the decoded bytes per 255-byte chunk, instead of one CRC per instruction. A
+      // mismatch throws the block away and recompiles. Code that rewrites its own next instruction
+      // inside this block is not seen until the block is entered again; function-entry decrypt is.
+      static int fh6_smc_block = -1;
+      if (fh6_smc_block < 0) {
+        const char* env = std::getenv("FEX_SMC_BLOCK");
+        fh6_smc_block = !(env && env[0] == '0' && env[1] == '\0');
+      }
+      const bool BlockSMC = fh6_smc_block && Block.Size != 0 &&
+                            ((Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL && BlockInfo->ContainsWritableCode) ||
+                             Block.ForceFullSMCDetection);
+      if (BlockSMC) {
+        for (uint64_t off = 0; off < Block.Size;) {
+          const uint64_t chunk = std::min<uint64_t>(255, Block.Size - off);
+          const auto bytes = reinterpret_cast<const uint8_t*>(Block.Entry + off);
+          const auto value = FEXCore::Utils::crc32(bytes, chunk);
+          auto addr = Thread->OpDispatcher->_EntrypointOffset(GPRSize, Block.Entry + off - GuestRIP);
+          auto crc = WantsDiskCachePatching ?
+                       Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, value, (int64_t)bytes, chunk) :
+                       Thread->OpDispatcher->Constant(value);
+          auto changed = Thread->OpDispatcher->_ValidateCode(crc, addr, static_cast<uint8_t>(chunk));
+          auto mismatch = Thread->OpDispatcher->CondJump(changed);
+          auto current = Thread->OpDispatcher->GetCurrentBlock();
+          auto fail = Thread->OpDispatcher->CreateNewCodeBlockAtEnd();
+          Thread->OpDispatcher->SetTrueJumpTarget(mismatch, fail);
+          Thread->OpDispatcher->SetCurrentCodeBlock(fail);
+          Thread->OpDispatcher->StartNewBlock();
+          Thread->OpDispatcher->_ThreadRemoveCodeEntry(Thread->OpDispatcher->_EntrypointOffset(GPRSize, 0),
+                                                        Thread->OpDispatcher->_EntrypointOffset(GPRSize, Block.Entry - GuestRIP));
+          auto next = Thread->OpDispatcher->CreateNewCodeBlockAfter(current);
+          Thread->OpDispatcher->SetFalseJumpTarget(mismatch, next);
+          Thread->OpDispatcher->SetCurrentCodeBlock(next);
+          Thread->OpDispatcher->StartNewBlock();
+          off += chunk;
+        }
+      }
+
       for (size_t i = 0; i < InstsInBlock; ++i) {
         uint64_t InstAddress = Block.Entry + BlockInstructionsLength;
         const FEXCore::X86Tables::X86InstInfo* TableInfo {nullptr};
@@ -641,7 +679,13 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
 
-        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
+        // Non-writable code can only change through a protection change or remap, which the
+        // frontend invalidates, so FULL only needs per-instruction validation for writable code.
+        // FEX_SMC_BLOCK=0 keeps that per-instruction CRC; the default checks the whole block once
+        // at entry (see above).
+        if (!fh6_smc_block && ((Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL && BlockInfo->ContainsWritableCode) ||
+                               Block.ForceFullSMCDetection) &&
+            DecodedInfo->InstSize != 0) {
           auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
 
