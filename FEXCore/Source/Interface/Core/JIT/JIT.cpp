@@ -697,6 +697,10 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
       Ptrs.SyscallHandlerObj = reinterpret_cast<uint64_t>(CTX->SyscallHandler);
       Ptrs.SyscallHandlerFunc = PMF.GetVTableEntry(CTX->SyscallHandler);
     }
+    {
+      FEXCore::Utils::MemberFunctionToPointerCast PMF(&FEXCore::HLE::SyscallHandler::HandleSynchronousFault);
+      Ptrs.GuestExceptionRaiseFunc = PMF.GetVTableEntry(CTX->SyscallHandler);
+    }
     Ptrs.ExitFunctionLink = reinterpret_cast<uintptr_t>(&Arm64JITCore::ExitFunctionLink);
     Ptrs.LUDIV = reinterpret_cast<uint64_t>(LUDIV);
     Ptrs.LDIV = reinterpret_cast<uint64_t>(LDIV);

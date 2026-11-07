@@ -32,6 +32,11 @@ public:
 
   virtual void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) = 0;
 
+  // Optional: raise a pending JIT synchronous fault (Break / #UD) from the
+  // SIGILL trampoline. Default is unused; ARM64EC implements this to
+  // NtRaiseException with the packed guest context.
+  virtual void HandleSynchronousFault(FEXCore::Core::CpuStateFrame* Frame) {}
+
   virtual void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
   virtual void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
   // A block's in-block code check failed. Frontends whose blocks on writable code all carry

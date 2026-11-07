@@ -832,8 +832,8 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
   RaiseGuestException(Thread, Rec, GuestContext);
 }
 
-// A Break the JIT routed through the syscall handler (FEX_FH6_FASTUD): the guest state is already
-// spilled at the faulting instruction, so raise the pending fault directly. Dispatch runs with
+// SIGILL trampoline (FEX_FH6_FASTUD): guest state is already spilled at the faulting
+// instruction. Raise the pending fault through NtRaiseException. Dispatch runs with
 // syscall callbacks disabled, as it does when the fault arrives through ResetToConsistentState.
 static void RaiseSynchronousGuestFault(uint64_t FPCR, uint64_t FPSR) {
   const auto CPUArea = GetCPUArea();
@@ -848,7 +848,14 @@ class ECSyscallHandler : public FEXCore::HLE::SyscallHandler, public FEXCore::Al
 public:
   ECSyscallHandler() = default;
 
-  void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
+  void HandleSynchronousFault(FEXCore::Core::CpuStateFrame* Frame) override {
+    uint64_t FPCR, FPSR;
+    __asm volatile("mrs %[fpcr], fpcr" : [fpcr] "=r"(FPCR));
+    __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
+    RaiseSynchronousGuestFault(FPCR, FPSR);
+  }
+
+  void HandleSyscall(FEXCore::Core::CpuStateFrame*) override {
     ProcessPendingCrossProcessEmulatorWork();
 
     // Manually raise an exeption with the current JIT state packed into a native context, ntdll handles this and
@@ -856,10 +863,6 @@ public:
     uint64_t FPCR, FPSR;
     __asm volatile("mrs %[fpcr], fpcr" : [fpcr] "=r"(FPCR));
     __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
-
-    if (Frame->SynchronousFaultData.FaultToTopAndGeneratedException) {
-      RaiseSynchronousGuestFault(FPCR, FPSR);
-    }
 
     auto* Thread = GetCPUArea().ThreadState();
     KiUserExceptionDispatcherStackLayout DispatchArgs {
