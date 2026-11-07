@@ -699,16 +699,8 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   return ECContext;
 }
 
-static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& Context) {
-  auto* Thread = GetCPUArea().ThreadState();
+static void RaiseGuestException(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& GuestContext) {
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
-
-  LogMan::Msg::DFmt("Reconstructing context");
-  if (!IsDispatcherAddress(Context.Pc)) {
-    ReconstructThreadState(Thread, Context);
-  }
-  ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
-  LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, GuestContext.Pc);
 
   // X64 Windows always clears TF, DF and AF when handling an exception, restoring after.
   // Current ARM64EC windows can only restore NZCV+SS when returning from an exception and other flags are left untouched from the handler context.
@@ -730,6 +722,27 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
   NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
 }
 
+static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& Context) {
+  auto* Thread = GetCPUArea().ThreadState();
+
+  LogMan::Msg::DFmt("Reconstructing context");
+  if (!IsDispatcherAddress(Context.Pc)) {
+    ReconstructThreadState(Thread, Context);
+  }
+  ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
+  LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, GuestContext.Pc);
+  RaiseGuestException(Thread, Rec, GuestContext);
+}
+
+// A Break the JIT routed through the syscall handler (FEX_FH6_FASTUD): the guest state is already
+// spilled at the faulting instruction, so raise the pending fault directly.
+static void RaiseSynchronousGuestFault(uint64_t FPCR, uint64_t FPSR) {
+  auto* Thread = GetCPUArea().ThreadState();
+  ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, static_cast<uint32_t>(FPCR), static_cast<uint32_t>(FPSR));
+  EXCEPTION_RECORD Rec {.ExceptionCode = static_cast<DWORD>(EXCEPTION_ILLEGAL_INSTRUCTION)};
+  RaiseGuestException(Thread, Rec, GuestContext);
+}
+
 class ECSyscallHandler : public FEXCore::HLE::SyscallHandler, public FEXCore::Allocator::FEXAllocOperators {
 public:
   ECSyscallHandler() = default;
@@ -742,6 +755,10 @@ public:
     uint64_t FPCR, FPSR;
     __asm volatile("mrs %[fpcr], fpcr" : [fpcr] "=r"(FPCR));
     __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
+
+    if (Frame->SynchronousFaultData.FaultToTopAndGeneratedException) {
+      RaiseSynchronousGuestFault(FPCR, FPSR);
+    }
 
     auto* Thread = GetCPUArea().ThreadState();
     KiUserExceptionDispatcherStackLayout DispatchArgs {
