@@ -7,6 +7,8 @@
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 
+#include <cstdlib>
+
 #ifndef _WIN32
 #include <FEXCore/Utils/PrctlUtils.h>
 #endif
@@ -16,8 +18,10 @@ static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
 // We don't want to move above 128MB atm because that means we will have to encode longer jumps
 static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
 
-CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed, fextl::shared_ptr<GuestToHostMap> Map)
-  : LookupCache(Map ? std::move(Map) : fextl::make_shared<GuestToHostMap>())
+CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed, fextl::shared_ptr<CodeBuffer> Prev)
+  : LookupCache(Prev ? Prev->LookupCache : fextl::make_shared<GuestToHostMap>())
+  , PrevInChain(std::move(Prev))
+  , ChainBytes(Size + (PrevInChain ? PrevInChain->ChainBytes : 0))
   , AllocatedSize(Size) {
   Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
   LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
@@ -53,9 +57,12 @@ SharedCodeBufferManager::SharedCodeBufferManager() {
   // `perf top` prefers VMA names over the JIT symbols file for some reason.
   // Breaks memory tracking when naming is enabled, but it's a debug feature so it isn't expected to be enabled by default.
   NameJITBuffers = !(GlobalJITNaming || LibraryJITNaming || BlockJITNaming);
+
+  const char* Budget = getenv("FEX_CODE_BUDGET_MB");
+  CodeBudget = size_t {Budget ? strtoull(Budget, nullptr, 10) : 1024} * 1024 * 1024;
 }
 
-fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size, fextl::shared_ptr<GuestToHostMap> Map) {
+fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size, fextl::shared_ptr<CodeBuffer> Prev) {
 #ifndef _WIN32
   // MDWE (Memory-Deny-Write-Execute) is a new Linux 6.3 feature.
   // It's equivalent to systemd's `MemoryDenyWriteExecute` but implemented entirely in the kernel.
@@ -78,18 +85,9 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size, 
   }
 #endif
 
-  auto Buffer = fextl::make_shared<CodeBuffer>(Size, NameJITBuffers, std::move(Map));
+  auto Buffer = fextl::make_shared<CodeBuffer>(Size, NameJITBuffers, std::move(Prev));
 
   Latest = Buffer;
-
-  Retained.push_back(Buffer);
-  const auto Index = RetainedCount.load(std::memory_order_relaxed);
-  if (Index < MAX_RETAINED_BUFFERS) {
-    const auto Begin = reinterpret_cast<uintptr_t>(Buffer->GetBufferBase());
-    RetainedBegin[Index].store(Begin, std::memory_order_relaxed);
-    RetainedEnd[Index].store(Begin + Buffer->UsableSize(), std::memory_order_relaxed);
-    RetainedCount.store(Index + 1, std::memory_order_release);
-  }
 
   OnCodeBufferAllocated(Buffer);
 
@@ -130,6 +128,9 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartOverflowCodeBuffer(c
   }
 
   const auto NewCodeBufferSize = std::min<size_t>(Latest->TotalAllocationSize() * 2, MAX_CODE_SIZE);
-  return AllocateNew(NewCodeBufferSize, Latest->LookupCache);
+  if (Latest->ChainBytes + NewCodeBufferSize > CodeBudget) {
+    return nullptr;
+  }
+  return AllocateNew(NewCodeBufferSize, Latest);
 }
 } // namespace FEXCore::CPU

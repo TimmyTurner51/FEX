@@ -27,7 +27,14 @@ struct CodeBuffer {
   // Shared by every buffer of one overflow chain; see SharedCodeBufferManager::StartOverflowCodeBuffer.
   fextl::shared_ptr<GuestToHostMap> LookupCache;
 
-  CodeBuffer(size_t Size, bool ShouldBeNamed, fextl::shared_ptr<GuestToHostMap> Map = nullptr);
+  // The buffer this one continues. The shared map hands out code from every buffer of the chain,
+  // so holding any of them keeps all older ones alive.
+  const fextl::shared_ptr<CodeBuffer> PrevInChain;
+
+  // Allocation size of this buffer and all older ones in its chain.
+  const size_t ChainBytes;
+
+  CodeBuffer(size_t Size, bool ShouldBeNamed, fextl::shared_ptr<CodeBuffer> Prev = nullptr);
   CodeBuffer(const CodeBuffer&) = delete;
   CodeBuffer& operator=(const CodeBuffer&) = delete;
   CodeBuffer(CodeBuffer&& oth) = delete;
@@ -95,6 +102,17 @@ struct CodeBuffer {
     return Ptr;
   }
 
+  // True if Address is code in this buffer or an older one of its chain. Signal-safe.
+  bool ChainContains(uintptr_t Address) const {
+    for (const CodeBuffer* Buffer = this; Buffer; Buffer = Buffer->PrevInChain.get()) {
+      const auto Begin = reinterpret_cast<uintptr_t>(Buffer->Ptr);
+      if (Address >= Begin && Address < Begin + Buffer->UsableSize()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
 private:
   uint8_t* Ptr;
   uint8_t* CodeBufferEnd;
@@ -132,34 +150,18 @@ public:
 
   // The latest buffer is full: allocate fresh code memory that shares its GuestToHostMap, so
   // every translation stays reachable instead of being recompiled. Returns the current latest
-  // instead if another thread already replaced `Prev`.
+  // instead if another thread already replaced `Prev`, or null once the chain would exceed the
+  // code budget (FEX_CODE_BUDGET_MB), in which case the caller clears the code cache.
   fextl::shared_ptr<CodeBuffer> StartOverflowCodeBuffer(const CodeBuffer* Prev);
-
-  // True if Address is inside any code buffer this manager ever allocated. Lock-free and
-  // signal-safe. Buffers are never freed, since a shared GuestToHostMap can hand out code
-  // from any buffer of its chain. Searched newest first.
-  bool IsRetainedCodeAddress(uintptr_t Address) const {
-    for (size_t i = RetainedCount.load(std::memory_order_acquire); i-- > 0;) {
-      if (Address >= RetainedBegin[i].load(std::memory_order_relaxed) && Address < RetainedEnd[i].load(std::memory_order_relaxed)) {
-        return true;
-      }
-    }
-    return false;
-  }
 
   virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
 
 private:
   std::mutex LatestMutex;
   fextl::shared_ptr<CodeBuffer> Latest;
+  size_t CodeBudget;
 
-  static constexpr size_t MAX_RETAINED_BUFFERS = 512;
-  fextl::vector<fextl::shared_ptr<CodeBuffer>> Retained;
-  std::atomic<uintptr_t> RetainedBegin[MAX_RETAINED_BUFFERS] {};
-  std::atomic<uintptr_t> RetainedEnd[MAX_RETAINED_BUFFERS] {};
-  std::atomic<size_t> RetainedCount {};
-
-  fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size, fextl::shared_ptr<GuestToHostMap> Map = nullptr);
+  fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size, fextl::shared_ptr<CodeBuffer> Prev = nullptr);
 
   bool NameJITBuffers {true};
 };

@@ -865,14 +865,13 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
 
   AllocatedInfo = CurrentCodeBuffer->AtomicAllocateBuffer(Size);
   if (AllocatedInfo.BufferAllocationOffset == nullptr) {
-    // Full: continue in fresh code memory on the same map instead of discarding every translation.
-    auto Prev = CurrentCodeBuffer;
-    CurrentCodeBuffer = SharedCodeBuffers.StartOverflowCodeBuffer(Prev.get());
-    if (CurrentCodeBuffer->LookupCache == Prev->LookupCache) {
+    // Full: continue in fresh code memory on the same map instead of discarding every translation,
+    // until the chain reaches the code budget.
+    if (auto Next = SharedCodeBuffers.StartOverflowCodeBuffer(CurrentCodeBuffer.get());
+        Next && Next->LookupCache == CurrentCodeBuffer->LookupCache) {
       FEXCore::FH6Stats::Add(FEXCore::FH6Stats::CodeBufferOverflows);
+      CurrentCodeBuffer = std::move(Next);
       AllocatedInfo = CurrentCodeBuffer->AtomicAllocateBuffer(Size);
-    } else {
-      CurrentCodeBuffer = std::move(Prev);
     }
   }
 
