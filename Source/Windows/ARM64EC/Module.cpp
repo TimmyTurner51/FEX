@@ -144,6 +144,14 @@ static fextl::string FormatSMC() {
       Out += "\n";
     }
   }
+  Out += fextl::fmt::format("exc overflow {}\n", __atomic_load_n(&fh6_exc[0][1], __ATOMIC_RELAXED));
+  for (size_t i = 1; i < 256; ++i) {
+    const uint64_t Rip = __atomic_load_n(&fh6_exc[i][0], __ATOMIC_RELAXED);
+    if (Rip) {
+      Out += fextl::fmt::format("exc rip {:x} count {} code {:x} bytes {:016x}\n", Rip, __atomic_load_n(&fh6_exc[i][1], __ATOMIC_RELAXED),
+                                __atomic_load_n(&fh6_exc[i][2], __ATOMIC_RELAXED), __builtin_bswap64(fh6_exc[i][3]));
+    }
+  }
   for (const auto& Row : fh6_shape) {
     const uint64_t Rip = __atomic_load_n(&Row[0], __ATOMIC_ACQUIRE);
     if (!Rip) {
@@ -711,6 +719,7 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
 
   BOOL FirstChance = TRUE;
   EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, Rec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance);
+  FEXCore::FH6Stats::NoteException(GuestContext.Pc, GuestRec.ExceptionCode);
   if (GuestRec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
     GuestContext.Cpsr &= ~(1 << 21); // PSTATE.SS
   } else if (GuestRec.ExceptionCode == EXCEPTION_BREAKPOINT) {

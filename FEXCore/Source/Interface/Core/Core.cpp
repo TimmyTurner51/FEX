@@ -516,6 +516,7 @@ uint8_t fh6_clone_bad[2][1024] {};
 uint64_t fh6_shape[64][10] {};
 uint64_t fh6_shape_tick {};
 uint64_t fh6_smc[4096][3] {};
+uint64_t fh6_exc[256][4] {};
 uint64_t (*fh6_blockmap)[2] {};
 uint64_t fh6_blockmap_count {};
 }

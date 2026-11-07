@@ -10,6 +10,9 @@ extern "C" uint64_t fh6_pool_keys[65536];
 extern "C" uint64_t fh6_clone_bad_info[4];
 extern "C" uint8_t fh6_clone_bad[2][1024];
 extern "C" uint64_t fh6_smc[4096][3];
+// Guest exceptions raised from JIT code, keyed by guest rip: {rip, count, exception code, first 8 guest bytes}.
+// Slot 0's count holds the overflow.
+extern "C" uint64_t fh6_exc[256][4];
 // Sampled shape rejects: {rip, blocks, block0 insns, block0 size, compile length, entry points, 32 guest bytes}.
 extern "C" uint64_t fh6_shape[64][10];
 extern "C" uint64_t fh6_shape_tick;
@@ -104,6 +107,36 @@ inline void NoteSMC(uint64_t Rip, uint64_t Resume) {
     }
   }
   __atomic_fetch_add(&fh6_smc[0][1], 1, __ATOMIC_RELAXED);
+}
+
+inline void NoteException(uint64_t Rip, uint32_t Code) {
+  size_t Slot = static_cast<size_t>((Rip * 0x9E3779B97F4A7C15ULL) >> 56);
+  for (size_t Probe = 0; Probe < 16; ++Probe, Slot = (Slot + 1) & 255) {
+    if (Slot == 0) {
+      continue;
+    }
+    uint64_t Key = __atomic_load_n(&fh6_exc[Slot][0], __ATOMIC_RELAXED);
+    if (Key == 0) {
+      uint64_t Expected = 0;
+      if (__atomic_compare_exchange_n(&fh6_exc[Slot][0], &Expected, Rip, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        // Only instructions the frontend just decoded are known to be readable.
+        if (Code == 0xC000001D || Code == 0xC0000096 || Code == 0x80000003) {
+          uint64_t Bytes;
+          __builtin_memcpy(&Bytes, reinterpret_cast<const void*>(Rip), sizeof(Bytes));
+          __atomic_store_n(&fh6_exc[Slot][3], Bytes, __ATOMIC_RELAXED);
+        }
+        Key = Rip;
+      } else {
+        Key = Expected;
+      }
+    }
+    if (Key == Rip) {
+      __atomic_store_n(&fh6_exc[Slot][2], Code, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&fh6_exc[Slot][1], 1, __ATOMIC_RELAXED);
+      return;
+    }
+  }
+  __atomic_fetch_add(&fh6_exc[0][1], 1, __ATOMIC_RELAXED);
 }
 
 static constexpr size_t BlockMapSlots = size_t {1} << 21;
