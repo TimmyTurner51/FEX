@@ -489,6 +489,12 @@ void ContextImpl::OnCodeBufferAllocated(const fextl::shared_ptr<CPU::CodeBuffer>
 
   {
     std::scoped_lock lk {CodeBufferListLock};
+    // Overflow buffers share their predecessor's map; invalidating it once is enough.
+    if (!CodeBufferList.empty()) {
+      if (auto Last = CodeBufferList.back().lock(); Last && Last->LookupCache == Buffer->LookupCache) {
+        return;
+      }
+    }
     CodeBufferList.emplace_back(Buffer);
   }
 }

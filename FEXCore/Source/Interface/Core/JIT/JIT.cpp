@@ -32,6 +32,7 @@ $end_info$
 #include <FEXCore/Utils/Profiler.h>
 #include <FEXCore/Utils/Telemetry.h>
 #include <FEXCore/Utils/TypeDefines.h>
+#include <FEXCore/Utils/FH6Stats.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 
 #include <cstdio>
@@ -854,11 +855,25 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
   CodeBuffer::CodeBufferAllocation AllocatedInfo {};
   LOGMAN_THROW_A_FMT(CurrentCodeBuffer->LookupCache.get() == ThreadState->LookupCache->Shared, "INVARIANT VIOLATED: SharedLookupCache "
                                                                                                "doesn't match up!\n");
-  // Bring CodeBuffer up to date
-  if (auto Prev = CheckCodeBufferUpdate()) {
+  // Bring CodeBuffer up to date. An overflow buffer keeps the same GuestToHostMap, so only a
+  // real cache clear needs to drop this thread's L1/L2 and call-ret stack.
+  if (auto Prev = CheckCodeBufferUpdate(); Prev && Prev->LookupCache != CurrentCodeBuffer->LookupCache) {
     Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
     auto lk = ThreadState->LookupCache->AcquireWriteLock();
     ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
+  }
+
+  AllocatedInfo = CurrentCodeBuffer->AtomicAllocateBuffer(Size);
+  if (AllocatedInfo.BufferAllocationOffset == nullptr) {
+    // Full: continue in fresh code memory on the same map instead of discarding every translation.
+    auto Prev = CurrentCodeBuffer;
+    CurrentCodeBuffer = SharedCodeBuffers.StartOverflowCodeBuffer(Prev.get());
+    if (CurrentCodeBuffer->LookupCache == Prev->LookupCache) {
+      FEXCore::FH6Stats::Add(FEXCore::FH6Stats::CodeBufferOverflows);
+      AllocatedInfo = CurrentCodeBuffer->AtomicAllocateBuffer(Size);
+    } else {
+      CurrentCodeBuffer = std::move(Prev);
+    }
   }
 
   // Attempt to allocate a buffer from the SharedCodeBuffers.

@@ -24,7 +24,7 @@ enum Counter : uint32_t {
   JITCompiles = 1,       // backend compiles that produced new code
   JITGuestBytes = 2,     // guest bytes covered by those compiles
   ReviveAttempts = 3,    // misses that had dormant translations for the RIP
-  ReviveHits = 4,        // dormant translation reinstated instead of compiling
+  CodeBufferOverflows = 4, // full code buffer continued in fresh memory on the same map
   ReviveHashMiss = 5,    // guest bytes differed
   ReviveSigMiss = 6,     // page executability/writability differed
   DormantStored = 7,     // erased translations kept for reuse

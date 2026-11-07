@@ -16,8 +16,9 @@ static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
 // We don't want to move above 128MB atm because that means we will have to encode longer jumps
 static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
 
-CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
-  : AllocatedSize(Size) {
+CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed, fextl::shared_ptr<GuestToHostMap> Map)
+  : LookupCache(Map ? std::move(Map) : fextl::make_shared<GuestToHostMap>())
+  , AllocatedSize(Size) {
   Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
   LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
 
@@ -34,8 +35,6 @@ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
 
   // Huge-pages reduce the amount of iTLB misses dramatically when it works.
   FEXCore::Allocator::VirtualTHPControl(Ptr, Size, FEXCore::Allocator::THPControl::Enable);
-
-  LookupCache = fextl::make_unique<GuestToHostMap>();
 
   CodeBufferEnd = Ptr + UsableSize();
   CodeBufferOffset = Ptr;
@@ -56,7 +55,7 @@ SharedCodeBufferManager::SharedCodeBufferManager() {
   NameJITBuffers = !(GlobalJITNaming || LibraryJITNaming || BlockJITNaming);
 }
 
-fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) {
+fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size, fextl::shared_ptr<GuestToHostMap> Map) {
 #ifndef _WIN32
   // MDWE (Memory-Deny-Write-Execute) is a new Linux 6.3 feature.
   // It's equivalent to systemd's `MemoryDenyWriteExecute` but implemented entirely in the kernel.
@@ -79,9 +78,18 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) 
   }
 #endif
 
-  auto Buffer = fextl::make_shared<CodeBuffer>(Size, NameJITBuffers);
+  auto Buffer = fextl::make_shared<CodeBuffer>(Size, NameJITBuffers, std::move(Map));
 
   Latest = Buffer;
+
+  Retained.push_back(Buffer);
+  const auto Index = RetainedCount.load(std::memory_order_relaxed);
+  if (Index < MAX_RETAINED_BUFFERS) {
+    const auto Begin = reinterpret_cast<uintptr_t>(Buffer->GetBufferBase());
+    RetainedBegin[Index].store(Begin, std::memory_order_relaxed);
+    RetainedEnd[Index].store(Begin + Buffer->UsableSize(), std::memory_order_relaxed);
+    RetainedCount.store(Index + 1, std::memory_order_release);
+  }
 
   OnCodeBufferAllocated(Buffer);
 
@@ -89,6 +97,7 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) 
 }
 
 fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::GetLatest() {
+  std::scoped_lock lk {LatestMutex};
   if (!Latest) {
     AllocateNew(INITIAL_CODE_SIZE);
   }
@@ -96,17 +105,31 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::GetLatest() {
 }
 
 fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartLargerCodeBuffer() {
+  std::scoped_lock lk {LatestMutex};
   if (!Latest) {
-    // Allocate initial CodeBuffer and return it
-    return GetLatest();
+    return AllocateNew(INITIAL_CODE_SIZE);
   }
 
-  auto NewCodeBufferSize = GetLatest()->TotalAllocationSize();
+  auto NewCodeBufferSize = Latest->TotalAllocationSize();
   NewCodeBufferSize = std::min<size_t>(NewCodeBufferSize * 2, MAX_CODE_SIZE);
   return AllocateNew(NewCodeBufferSize);
 }
 
 fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartMaximalCodeBuffer() {
+  std::scoped_lock lk {LatestMutex};
   return AllocateNew(MAX_CODE_SIZE);
+}
+
+fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartOverflowCodeBuffer(const CodeBuffer* Prev) {
+  std::scoped_lock lk {LatestMutex};
+  if (!Latest) {
+    return AllocateNew(INITIAL_CODE_SIZE);
+  }
+  if (Latest.get() != Prev) {
+    return Latest;
+  }
+
+  const auto NewCodeBufferSize = std::min<size_t>(Latest->TotalAllocationSize() * 2, MAX_CODE_SIZE);
+  return AllocateNew(NewCodeBufferSize, Latest->LookupCache);
 }
 } // namespace FEXCore::CPU

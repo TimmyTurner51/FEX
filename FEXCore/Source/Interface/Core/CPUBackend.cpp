@@ -347,7 +347,7 @@ namespace CPU {
       return (Address >= BufferPtr && Address < LastPageAddr);
     };
 
-    if (CheckCodeBuffer(*CurrentCodeBuffer, Address)) {
+    if (CheckCodeBuffer(*CurrentCodeBuffer, Address) || SharedCodeBuffers.IsRetainedCodeAddress(Address)) {
       return true;
     }
     for (const auto& Buffer : SignalHandlerCodeBuffers) {

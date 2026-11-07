@@ -8,12 +8,15 @@ $end_info$
 #pragma once
 
 #include <FEXCore/fextl/memory.h>
+#include <FEXCore/fextl/vector.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/TypeDefines.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 
 namespace FEXCore {
 struct GuestToHostMap;
@@ -21,9 +24,10 @@ struct GuestToHostMap;
 
 namespace FEXCore::CPU {
 struct CodeBuffer {
-  fextl::unique_ptr<GuestToHostMap> LookupCache;
+  // Shared by every buffer of one overflow chain; see SharedCodeBufferManager::StartOverflowCodeBuffer.
+  fextl::shared_ptr<GuestToHostMap> LookupCache;
 
-  CodeBuffer(size_t Size, bool ShouldBeNamed);
+  CodeBuffer(size_t Size, bool ShouldBeNamed, fextl::shared_ptr<GuestToHostMap> Map = nullptr);
   CodeBuffer(const CodeBuffer&) = delete;
   CodeBuffer& operator=(const CodeBuffer&) = delete;
   CodeBuffer(CodeBuffer&& oth) = delete;
@@ -126,12 +130,36 @@ public:
   // Subsequent calls to GetLatest will point to the returned buffer.
   fextl::shared_ptr<CodeBuffer> StartMaximalCodeBuffer();
 
+  // The latest buffer is full: allocate fresh code memory that shares its GuestToHostMap, so
+  // every translation stays reachable instead of being recompiled. Returns the current latest
+  // instead if another thread already replaced `Prev`.
+  fextl::shared_ptr<CodeBuffer> StartOverflowCodeBuffer(const CodeBuffer* Prev);
+
+  // True if Address is inside any code buffer this manager ever allocated. Lock-free and
+  // signal-safe. Buffers are never freed, since a shared GuestToHostMap can hand out code
+  // from any buffer of its chain. Searched newest first.
+  bool IsRetainedCodeAddress(uintptr_t Address) const {
+    for (size_t i = RetainedCount.load(std::memory_order_acquire); i-- > 0;) {
+      if (Address >= RetainedBegin[i].load(std::memory_order_relaxed) && Address < RetainedEnd[i].load(std::memory_order_relaxed)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
 
 private:
+  std::mutex LatestMutex;
   fextl::shared_ptr<CodeBuffer> Latest;
 
-  fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size);
+  static constexpr size_t MAX_RETAINED_BUFFERS = 512;
+  fextl::vector<fextl::shared_ptr<CodeBuffer>> Retained;
+  std::atomic<uintptr_t> RetainedBegin[MAX_RETAINED_BUFFERS] {};
+  std::atomic<uintptr_t> RetainedEnd[MAX_RETAINED_BUFFERS] {};
+  std::atomic<size_t> RetainedCount {};
+
+  fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size, fextl::shared_ptr<GuestToHostMap> Map = nullptr);
 
   bool NameJITBuffers {true};
 };
