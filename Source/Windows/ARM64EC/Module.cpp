@@ -833,9 +833,12 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
 }
 
 // A Break the JIT routed through the syscall handler (FEX_FH6_FASTUD): the guest state is already
-// spilled at the faulting instruction, so raise the pending fault directly.
+// spilled at the faulting instruction, so raise the pending fault directly. Dispatch runs with
+// syscall callbacks disabled, as it does when the fault arrives through ResetToConsistentState.
 static void RaiseSynchronousGuestFault(uint64_t FPCR, uint64_t FPSR) {
-  auto* Thread = GetCPUArea().ThreadState();
+  const auto CPUArea = GetCPUArea();
+  CPUArea.Area->InSyscallCallback = true;
+  auto* Thread = CPUArea.ThreadState();
   ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, static_cast<uint32_t>(FPCR), static_cast<uint32_t>(FPSR));
   EXCEPTION_RECORD Rec {.ExceptionCode = static_cast<DWORD>(EXCEPTION_ILLEGAL_INSTRUCTION)};
   RaiseGuestException(Thread, Rec, GuestContext);
