@@ -63,6 +63,8 @@ public:
     Relocations.clear();
   }
 
+  void SetRelocatablePadding(bool Enable) override;
+
 private:
   const bool HostSupportsSVE128 {};
   const bool HostSupportsSVE256 {};

@@ -118,6 +118,11 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   uint64_t JITGuardOverflowArgument {};
   FEXCore::UncheckedLongJump::JumpBuf RestartJump;
 
+  // Pool stub copies (Core.cpp). Kept here because the ARM64EC module has no implicit TLS.
+  bool PoolPatchable {};
+  uint32_t PoolCopySize {};
+  alignas(16) uint8_t PoolCopy[4096];
+
   // BaseFrameState should always be at the end, directly before the interrupt fault page
   FEXCore::Core::CpuStateFrame BaseFrameState {};
 

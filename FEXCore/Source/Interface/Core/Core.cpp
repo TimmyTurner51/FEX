@@ -56,6 +56,7 @@ $end_info$
 #include <FEXCore/fextl/memory.h>
 #include <FEXCore/fextl/set.h>
 #include <FEXCore/fextl/sstream.h>
+#include <FEXCore/fextl/unordered_map.h>
 #include <FEXCore/fextl/vector.h>
 #include <FEXHeaderUtils/Syscalls.h>
 
@@ -80,10 +81,18 @@ $end_info$
 #include <xxhash.h>
 
 namespace FEXCore::Context {
+namespace {
+// Read once here: getenv takes the CRT environment lock, which must not be taken while compiling.
+int PoolCloneModeValue = 1;
+} // namespace
+
 ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   : HostFeatures {Features}
   , CPUID {this}
   , CodeCache {*this} {
+  if (const char* Env = getenv("FEX_POOL_CLONE")) {
+    PoolCloneModeValue = atoi(Env);
+  }
   if (!Config.Is64BitMode()) {
     // When operating in 32-bit mode, the virtual memory we care about is only the lower 32-bits.
     Config.VirtualMemSize = 1ULL << 32;
@@ -511,6 +520,269 @@ uint64_t (*fh6_blockmap)[2] {};
 uint64_t fh6_blockmap_count {};
 }
 
+namespace {
+constexpr uint64_t MaxX86InstSize = 15;
+
+// Trampoline pools keep rewriting slots with "one instruction; jmp rel32" stubs whose instruction and
+// absolute jump target recur at other slots. Such a translation depends on its address only through
+// relocated constants: entry-relative RIPs move with the slot, the jump target stays, and the entry CRC
+// covers the slot bytes. FEX_POOL_CLONE: 0 off, 1 (default) publish copies, 2 build copies and compare
+// them with a fresh compile without using them.
+
+struct PoolTemplate {
+  uint64_t Entry;
+  uint64_t Target;
+  uint32_t InsnLen;
+  uint32_t EntryOffset;
+  bool Writable;
+  std::array<uint8_t, MaxX86InstSize> Insn;
+  fextl::vector<uint8_t> Host;
+  fextl::vector<FEXCore::CPU::Relocation> Relocs;
+};
+
+struct PoolTemplateShard {
+  std::mutex Mutex;
+  fextl::unordered_map<uint64_t, fextl::shared_ptr<const PoolTemplate>> Map;
+};
+constexpr size_t PoolShards = 128;
+constexpr size_t PoolShardLimit = 512;
+PoolTemplateShard PoolTemplates[PoolShards];
+
+std::atomic<uint32_t> PoolVerifyTick {};
+
+uint64_t PoolKey(const uint8_t* Insn, uint64_t Len, uint64_t Target) {
+  uint64_t Key = 0x9E3779B97F4A7C15ULL ^ Target;
+  for (uint64_t i = 0; i < Len; ++i) {
+    Key = (Key ^ Insn[i]) * 0x100000001B3ULL;
+  }
+  Key = (Key ^ (Key >> 29)) * 0xBF58476D1CE4E5B9ULL;
+  return Key ^ (Key >> 32);
+}
+
+uint64_t PoolJmpTarget(const uint8_t* Code, uint64_t Entry, uint64_t InsnLen) {
+  int32_t Rel;
+  memcpy(&Rel, Code + InsnLen + 1, sizeof(Rel));
+  return Entry + InsnLen + 5 + static_cast<int64_t>(Rel);
+}
+
+fextl::shared_ptr<const PoolTemplate> FindPoolTemplate(uint64_t Key) {
+  auto& Shard = PoolTemplates[Key % PoolShards];
+  std::scoped_lock Lock(Shard.Mutex);
+  auto It = Shard.Map.find(Key);
+  return It == Shard.Map.end() ? nullptr : It->second;
+}
+
+void StorePoolTemplate(uint64_t Key, fextl::shared_ptr<const PoolTemplate> Template) {
+  auto& Shard = PoolTemplates[Key % PoolShards];
+  std::scoped_lock Lock(Shard.Mutex);
+  if (Shard.Map.size() >= PoolShardLimit) {
+    Shard.Map.clear();
+  }
+  Shard.Map[Key] = std::move(Template);
+}
+
+// Value of a padded 64-bit constant load (movz/movk/nop), as emitted for relocatable constants.
+std::optional<uint64_t> ReadPaddedConstant(const uint8_t* Code) {
+  uint64_t Value = 0;
+  bool Any = false;
+  for (int i = 0; i < 4; ++i) {
+    uint32_t Inst;
+    memcpy(&Inst, Code + i * 4, sizeof(Inst));
+    if (Inst == 0xD503201F) {
+      continue;
+    }
+    const uint32_t Op = Inst & 0xFF800000;
+    if (Op != 0xD2800000 && Op != 0xF2800000) {
+      return std::nullopt;
+    }
+    const uint32_t Shift = ((Inst >> 21) & 3) * 16;
+    const uint64_t Imm = (Inst >> 5) & 0xFFFF;
+    Value = (Op == 0xD2800000 ? 0 : Value & ~(0xFFFFULL << Shift)) | (Imm << Shift);
+    Any = true;
+  }
+  return Any ? std::optional<uint64_t>(Value) : std::nullopt;
+}
+
+// What the disk cache would patch in for a patchable relocation, computed from a snapshot of the slot
+// at Entry instead of live memory. Offset is the site's offset in the slot.
+uint64_t PoolPatchableValue(CPU::RelocationTypes Type, uint64_t Offset, uint64_t Entry, uint8_t Size, const uint8_t* Snapshot) {
+  if (Type == CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE) {
+    return FEXCore::Utils::crc32(Snapshot + Offset, Size);
+  }
+  uint64_t Raw = 0;
+  memcpy(&Raw, Snapshot + Offset, Size);
+  const int64_t Data = Size == 1 ? int64_t(int8_t(Raw)) : Size == 2 ? int64_t(int16_t(Raw)) : Size == 4 ? int64_t(int32_t(Raw)) : int64_t(Raw);
+  if (Type == CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE) {
+    return Data;
+  }
+  return Entry + Offset + Size + Data;
+}
+
+bool PatchPoolCopy(ContextImpl* CTX, const PoolTemplate& Template, uint64_t NewEntry, const uint8_t* Snapshot, uint8_t* Out) {
+  memcpy(Out, Template.Host.data(), Template.Host.size());
+  CPU::Arm64Emitter Emitter(CTX, Out, Template.Host.size());
+  const auto Move = [&](uint64_t Old) {
+    return Old == Template.Target ? Old : Old - Template.Entry + NewEntry;
+  };
+  for (const auto& Reloc : Template.Relocs) {
+    Emitter.SetCursorOffset(Reloc.Header.Offset);
+    switch (Reloc.Header.Type) {
+    case CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL:
+    case CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE: break;
+    case CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL: Emitter.dc64(Move(Reloc.GuestRIP.GuestRIP)); break;
+    case CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE:
+      Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(Reloc.GuestRIP.RegisterIndex), Move(Reloc.GuestRIP.GuestRIP),
+                           CPU::Arm64Emitter::PadType::DOPAD);
+      break;
+    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE:
+    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE:
+    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE:
+    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL: {
+      const auto& Data = Reloc.GuestPatchableData;
+      const uint64_t Value = PoolPatchableValue(Reloc.Header.Type, Data.SiteAddress - Template.Entry, NewEntry, Data.ValueSize, Snapshot);
+      if (Reloc.Header.Type == CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL) {
+        Emitter.dc64(Value);
+      } else {
+        Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(Data.RegisterIndex), Value, CPU::Arm64Emitter::PadType::DOPAD);
+      }
+      break;
+    }
+    default: return false;
+    }
+  }
+  return true;
+}
+
+// Builds a template from a fresh compile of a pool stub, or returns null if the block isn't one.
+// The guest bytes are re-read here, so the embedded entry CRC must match them: otherwise the slot was
+// rewritten after decoding and the code belongs to other bytes.
+fextl::shared_ptr<PoolTemplate> MakePoolTemplate(const Frontend::Decoder::DecodedBlockInformation& BlockInfo, uint64_t GuestRIP,
+                                                 uint64_t Length, bool Writable, const CPU::CPUBackend::CompiledCode& Code,
+                                                 std::span<const CPU::Relocation> Relocs) {
+  const auto Reject = [](FH6Stats::Counter Reason) -> fextl::shared_ptr<PoolTemplate> {
+    FH6Stats::Add(Reason);
+    return nullptr;
+  };
+  if (!Writable) {
+    return Reject(FH6Stats::PoolRejectNotWritable);
+  }
+  if (BlockInfo.Blocks.size() != 1 || Code.EntryPoints.size() != 1) {
+    return Reject(FH6Stats::PoolRejectShape);
+  }
+  const auto& Block = BlockInfo.Blocks[0];
+  if (Block.Entry != GuestRIP || Block.Size != Length || Block.ForceFullSMCDetection) {
+    return Reject(FH6Stats::PoolRejectShape);
+  }
+  // A lone ret: no jump target, so Target stays 0 and nothing in the copy is kept fixed.
+  const bool RetStub = Block.NumInstructions == 1 && Length == 1;
+  uint64_t InsnLen = 1;
+  if (!RetStub) {
+    if (Block.NumInstructions != 2) {
+      return Reject(FH6Stats::PoolRejectShape);
+    }
+    const auto& Insn = Block.DecodedInstructions[0];
+    const auto& Jmp = Block.DecodedInstructions[1];
+    InsnLen = Insn.InstSize;
+    if (InsnLen == 0 || InsnLen > MaxX86InstSize || Jmp.InstSize != 5 || InsnLen + 5 != Length) {
+      return Reject(FH6Stats::PoolRejectShape);
+    }
+    if (Insn.TableInfo == nullptr ||
+        (Insn.TableInfo->Flags & (X86Tables::InstFlags::FLAGS_BLOCK_END | X86Tables::InstFlags::FLAGS_SETS_RIP | X86Tables::InstFlags::FLAGS_CALL))) {
+      return Reject(FH6Stats::PoolRejectInsn);
+    }
+    const auto RipRelative = [](const X86Tables::DecodedOperand& Operand) {
+      return Operand.IsRIPRelative() || Operand.IsRIPRelativeRelocation();
+    };
+    if (RipRelative(Insn.Dest) || RipRelative(Insn.Src[0]) || RipRelative(Insn.Src[1]) || RipRelative(Insn.Src[2])) {
+      return Reject(FH6Stats::PoolRejectInsn);
+    }
+  }
+
+  std::array<uint8_t, MaxX86InstSize + 5> Snapshot;
+  memcpy(Snapshot.data(), reinterpret_cast<const void*>(GuestRIP), Length);
+  uint64_t Target = 0;
+  if (RetStub) {
+    if (Snapshot[0] != 0xC3) {
+      return Reject(FH6Stats::PoolRejectBytes);
+    }
+  } else {
+    if (Snapshot[InsnLen] != 0xE9) {
+      return Reject(FH6Stats::PoolRejectBytes);
+    }
+    Target = PoolJmpTarget(Snapshot.data(), GuestRIP, InsnLen);
+    if (Target >= GuestRIP - 32 && Target < GuestRIP + Length + 32) {
+      return Reject(FH6Stats::PoolRejectBytes);
+    }
+  }
+
+  const auto EntryHost = Code.EntryPoints.begin()->second;
+  auto Template = fextl::make_shared<PoolTemplate>();
+  Template->Entry = GuestRIP;
+  Template->Target = Target;
+  Template->InsnLen = InsnLen;
+  Template->EntryOffset = EntryHost - Code.BlockBegin;
+  Template->Writable = Writable;
+  memcpy(Template->Insn.data(), Snapshot.data(), InsnLen);
+  Template->Host.assign(Code.BlockBegin, Code.BlockBegin + Code.Size);
+
+  bool HasCrc = false;
+  for (const auto& Reloc : Relocs) {
+    const bool Literal = Reloc.Header.Type == CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL ||
+                         Reloc.Header.Type == CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL ||
+                         Reloc.Header.Type == CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL;
+    if (Reloc.Header.Offset + (Literal ? 8 : 16) > Code.Size) {
+      return Reject(FH6Stats::PoolRejectReloc);
+    }
+    switch (Reloc.Header.Type) {
+    case CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL:
+    case CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE: break;
+    case CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL:
+    case CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE: {
+      const uint64_t Value = Reloc.GuestRIP.GuestRIP;
+      if (Value != Target && (Value < GuestRIP || Value > GuestRIP + Length)) {
+        return Reject(FH6Stats::PoolRejectRelocValue);
+      }
+      if (Reloc.Header.Type == CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE && ReadPaddedConstant(Template->Host.data() + Reloc.Header.Offset) != Value) {
+        return Reject(FH6Stats::PoolRejectRelocValue);
+      }
+      break;
+    }
+    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE:
+    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE:
+    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE:
+    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL: {
+      const bool Crc = Reloc.Header.Type == CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE;
+      const uint64_t Site = Reloc.GuestPatchableData.SiteAddress;
+      const uint64_t Size = Reloc.GuestPatchableData.ValueSize;
+      if (Site < GuestRIP || Site + Size > GuestRIP + Length || (!Crc && Size != 1 && Size != 2 && Size != 4 && Size != 8)) {
+        return Reject(Crc ? FH6Stats::PoolRejectCrc : FH6Stats::PoolRejectReloc);
+      }
+      const uint64_t Expected = PoolPatchableValue(Reloc.Header.Type, Site - GuestRIP, GuestRIP, Size, Snapshot.data());
+      std::optional<uint64_t> Embedded;
+      if (Reloc.Header.Type == CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL) {
+        uint64_t Lit;
+        memcpy(&Lit, Template->Host.data() + Reloc.Header.Offset, sizeof(Lit));
+        Embedded = Lit;
+      } else {
+        Embedded = ReadPaddedConstant(Template->Host.data() + Reloc.Header.Offset);
+      }
+      if (!Embedded || *Embedded != Expected) {
+        return Reject(Crc ? FH6Stats::PoolRejectCrc : FH6Stats::PoolRejectRelocValue);
+      }
+      HasCrc |= Crc;
+      break;
+    }
+    default: return Reject(FH6Stats::PoolRejectReloc);
+    }
+  }
+  if (!HasCrc) {
+    return Reject(FH6Stats::PoolRejectCrc);
+  }
+  Template->Relocs.assign(Relocs.begin(), Relocs.end());
+  return Template;
+}
+} // namespace
+
 void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer) {
   FEXCORE_PROFILE_INSTANT("ClearCodeCache");
   FEXCore::FH6Stats::Add(NewCodeBuffer ? FEXCore::FH6Stats::ClearCacheNewBuffer : FEXCore::FH6Stats::ClearCacheKeepBuffer);
@@ -549,7 +821,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
   bool HasCustomIR {};
 
-  bool WantsDiskCachePatching = DiskCache.IsReadingDiskCache() || DiskCache.IsWritingDiskCache();
+  bool WantsDiskCachePatching = DiskCache.IsReadingDiskCache() || DiskCache.IsWritingDiskCache() || Thread->PoolPatchable;
 
   if (HasCustomIRHandlers.load(std::memory_order_relaxed)) {
     std::shared_lock lk(CustomIRMutex);
@@ -940,9 +1212,75 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
   FEXCore::FH6Stats::Add(FEXCore::FH6Stats::CompileBlockMiss);
 
+  std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
+
+  const bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
+  HLE::ExecutableRangeInfo RangeInfo {};
+  if (PoolCloneModeValue != 0 && !Region && MaxInst == 0 && !TFSet) {
+    RangeInfo = SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP);
+  }
+  const bool PoolCandidate = RangeInfo.Size != 0;
+  auto& PoolCopy = Thread->PoolCopy;
+  auto& PoolCopySize = Thread->PoolCopySize;
+  PoolCopySize = 0;
+  if (PoolCandidate) {
+    // One snapshot of the slot: the template match and the entry CRC must describe the same bytes.
+    std::array<uint8_t, MaxX86InstSize + 5> Snapshot;
+    const uint64_t RangeEnd = RangeInfo.Base + RangeInfo.Size;
+    const uint64_t Avail = RangeEnd > GuestRIP ? std::min<uint64_t>(Snapshot.size(), RangeEnd - GuestRIP) : 0;
+    memcpy(Snapshot.data(), reinterpret_cast<const void*>(GuestRIP), Avail);
+    // {InsnLen, Target}: a lone ret (Target 0), or one instruction followed by jmp rel32.
+    std::array<std::pair<uint64_t, uint64_t>, MaxX86InstSize + 1> Candidates;
+    size_t NumCandidates = 0;
+    if (Avail >= 1 && Snapshot[0] == 0xC3) {
+      Candidates[NumCandidates++] = {1, 0};
+    }
+    for (uint64_t InsnLen = 1; InsnLen <= MaxX86InstSize && InsnLen + 5 <= Avail; ++InsnLen) {
+      if (Snapshot[InsnLen] == 0xE9) {
+        Candidates[NumCandidates++] = {InsnLen, PoolJmpTarget(Snapshot.data(), GuestRIP, InsnLen)};
+      }
+    }
+    for (size_t Candidate = 0; Candidate < NumCandidates; ++Candidate) {
+      const auto [InsnLen, Target] = Candidates[Candidate];
+      const auto Template = FindPoolTemplate(PoolKey(Snapshot.data(), InsnLen, Target));
+      if (!Template || Template->InsnLen != InsnLen || Template->Target != Target || Template->Writable != RangeInfo.Writable ||
+          memcmp(Template->Insn.data(), Snapshot.data(), InsnLen) != 0) {
+        continue;
+      }
+      if (Template->Host.size() > sizeof(PoolCopy) || !PatchPoolCopy(this, *Template, GuestRIP, Snapshot.data(), PoolCopy)) {
+        break;
+      }
+      PoolCopySize = Template->Host.size();
+      // Mode 1 still checks one copy in 256 against a fresh compile.
+      if (PoolCloneModeValue == 2 || (PoolVerifyTick.fetch_add(1, std::memory_order_relaxed) & 255) == 0) {
+        break;
+      }
+      const uint32_t CopySize = PoolCopySize;
+      PoolCopySize = 0;
+      const auto Loaded = Thread->CPUBackend->LoadCachedCode({PoolCopy, CopySize});
+      if (!Loaded.BlockBegin) {
+        break;
+      }
+      const std::array<uint64_t, 1> Entry {GuestRIP};
+      const uint64_t LastByte = GuestRIP + InsnLen + (Target ? 5 : 0) - 1;
+      const std::array<uint64_t, 2> Pages {GuestRIP & FEXCore::Utils::FEX_PAGE_MASK, LastByte & FEXCore::Utils::FEX_PAGE_MASK};
+      const size_t NumPages = Pages[0] == Pages[1] ? 1 : 2;
+      for (size_t i = 0; i < NumPages; ++i) {
+        if (Thread->LookupCache->AddBlockExecutableRange(Thread, Entry, Pages[i], FEXCore::Utils::FEX_PAGE_SIZE)) {
+          SyscallHandler->MarkGuestExecutableRange(Thread, Pages[i], FEXCore::Utils::FEX_PAGE_SIZE);
+        }
+      }
+      void* Host = Loaded.BlockBegin + Template->EntryOffset;
+      Thread->LookupCache->AddBlockMapping(Thread, GuestRIP, std::span<const uint64_t>(Pages.data(), NumPages), Host);
+      FEXCore::FH6Stats::NoteBlock(GuestRIP, reinterpret_cast<uint64_t>(Host));
+      FEXCore::FH6Stats::Add(FEXCore::FH6Stats::PoolCloneHits);
+      FEXCore::FH6Stats::Add(FEXCore::FH6Stats::JITHostBytes, CopySize);
+      return reinterpret_cast<uintptr_t>(Host);
+    }
+  }
+
   Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
 
-  std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
   std::optional<DiskCache::CodeHitData> Hit;
   std::optional<uint64_t> DiskCacheGuestCodeKey;
   {
@@ -987,7 +1325,11 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   FEXCore::FH6Stats::Add(FEXCore::FH6Stats::JITCompiles);
 
   const uint64_t CompileStart = FEXCore::FH6Stats::Ticks();
+  Thread->PoolPatchable = PoolCandidate;
+  Thread->CPUBackend->SetRelocatablePadding(PoolCandidate);
   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
+  Thread->PoolPatchable = false;
+  Thread->CPUBackend->SetRelocatablePadding(false);
   FEXCore::FH6Stats::Add(FEXCore::FH6Stats::JITCompileTicks, FEXCore::FH6Stats::Ticks() - CompileStart);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
@@ -1076,6 +1418,33 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
     if (CodeMapWriter && Region && Region->FileStartVA != 0) {
       CodeMapWriter->AppendBlock(*Region, GuestRIP);
+    }
+  }
+
+  if (!Region) {
+    FEXCore::FH6Stats::NotePoolCompile(reinterpret_cast<const uint8_t*>(StartAddr), Length);
+  }
+  if (!Region && !(PoolCandidate && NeedsAddGuestCodeRanges)) {
+    FEXCore::FH6Stats::Add(FEXCore::FH6Stats::PoolRejectNotCandidate);
+  }
+  if (PoolCandidate && NeedsAddGuestCodeRanges) {
+    if (PoolCopySize) {
+      if (PoolCopySize == CompiledCode.Size && memcmp(PoolCopy, CompiledCode.BlockBegin, CompiledCode.Size) == 0) {
+        FEXCore::FH6Stats::Add(FEXCore::FH6Stats::PoolVerifyOK);
+      } else {
+        FEXCore::FH6Stats::Add(FEXCore::FH6Stats::PoolVerifyBad);
+        FEXCore::FH6Stats::NoteCloneMismatch(GuestRIP, PoolCopy, PoolCopySize, CompiledCode.BlockBegin, CompiledCode.Size);
+      }
+      PoolCopySize = 0;
+    }
+    std::span<const CPU::Relocation> Relocs;
+    if (DebugData->Relocations) {
+      Relocs = *DebugData->Relocations;
+    }
+    if (auto Template = MakePoolTemplate(*Thread->FrontendDecoder->GetDecodedBlockInfo(), GuestRIP, Length, RangeInfo.Writable, CompiledCode, Relocs)) {
+      const uint64_t Key = PoolKey(Template->Insn.data(), Template->InsnLen, Template->Target);
+      StorePoolTemplate(Key, std::move(Template));
+      FEXCore::FH6Stats::Add(FEXCore::FH6Stats::PoolTemplatesStored);
     }
   }
 
@@ -1181,6 +1550,7 @@ void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Fra
 
   FEXCore::FH6Stats::Add(FEXCore::FH6Stats::SMCMismatch);
   FEXCore::FH6Stats::NoteSMC(GuestRIP & ~0xFFFULL, GuestRIP);
+  FEXCore::FH6Stats::NoteShape(GuestRIP, 0, 0, 0, std::min<uint64_t>(32, 0x1000 - (GuestRIP & 0xFFF)), 0);
 
   if (CTX->Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL) {
     // Every block compiled from writable code validates its own bytes on entry, so a thread that

@@ -131,6 +131,9 @@ namespace CPU {
      */
     virtual void ClearRelocations() {}
 
+    // Pad relocatable constants to a fixed length for the next compiles, even without a code cache.
+    virtual void SetRelocatablePadding(bool Enable) {}
+
     bool IsAddressInCodeBuffer(uintptr_t Address) const;
 
     // Updates the CodeBuffer if needed and returns a reference to the old one.

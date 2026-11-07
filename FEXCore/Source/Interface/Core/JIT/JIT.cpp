@@ -1214,6 +1214,10 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   return std::move(CodeData);
 }
 
+void Arm64JITCore::SetRelocatablePadding(bool Enable) {
+  SupportCodeRelocations = Enable || CTX->RequiresRelocatableConstants();
+}
+
 CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> HostBytes) {
   // we stored it aligned, better still be?
   LOGMAN_THROW_A_FMT(HostBytes.size() % 16 == 0, "Needs to be 16B aligned!");
