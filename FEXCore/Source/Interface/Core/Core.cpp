@@ -51,6 +51,7 @@ $end_info$
 #include <FEXCore/Utils/Threads.h>
 #include <FEXCore/Utils/Profiler.h>
 #include <FEXCore/Utils/SHMStats.h>
+#include <FEXCore/Utils/FH6Stats.h>
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/memory.h>
 #include <FEXCore/fextl/set.h>
@@ -492,8 +493,21 @@ void ContextImpl::OnCodeBufferAllocated(const fextl::shared_ptr<CPU::CodeBuffer>
   }
 }
 
+extern "C" {
+uint64_t fh6_stats[55] {};
+uint64_t fh6_pool_keys[65536] {};
+uint64_t fh6_clone_bad_info[4] {};
+uint8_t fh6_clone_bad[2][1024] {};
+uint64_t fh6_shape[64][10] {};
+uint64_t fh6_shape_tick {};
+uint64_t fh6_smc[4096][3] {};
+uint64_t (*fh6_blockmap)[2] {};
+uint64_t fh6_blockmap_count {};
+}
+
 void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer) {
   FEXCORE_PROFILE_INSTANT("ClearCodeCache");
+  FEXCore::FH6Stats::Add(NewCodeBuffer ? FEXCore::FH6Stats::ClearCacheNewBuffer : FEXCore::FH6Stats::ClearCacheKeepBuffer);
 
   if (NewCodeBuffer) {
     // Allocate new CodeBuffer + L3 LookupCache and clear L1+L2 caches
@@ -918,6 +932,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
     return HostCode;
   }
+  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::CompileBlockMiss);
 
   Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
 
@@ -950,6 +965,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
         LOGMAN_THROW_A_FMT(CachedHostCode != 0, "Couldn't find GuestRIP in Disk Cache entrypoints!");
 
         FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheHitCount, 1);
+        FEXCore::FH6Stats::Add(FEXCore::FH6Stats::DiskCacheHits);
         Thread->FrontendDecoder->DelayedDisownBuffer();
 
         Thread->FrontendDecoder->ValidateDisownedOrFree();
@@ -962,15 +978,21 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
+  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::JITCompiles);
 
+  const uint64_t CompileStart = FEXCore::FH6Stats::Ticks();
   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
+  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::JITCompileTicks, FEXCore::FH6Stats::Ticks() - CompileStart);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
     return 0;
   } else if (!DebugData) {
     // DebugData wasn't populated, indicating another thread raced us for compiling this block
+    FEXCore::FH6Stats::Add(FEXCore::FH6Stats::RacedCompiles);
     return reinterpret_cast<uintptr_t>(CodePtr);
   }
+  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::JITGuestBytes, Length);
+  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::JITHostBytes, CompiledCode.Size);
 
   if (DiskCacheGuestCodeKey && Hit && DiskCache.IsValidating()) {
     DiskCache.Validate(*DiskCacheGuestCodeKey, *Hit, CompiledCode, Region);
@@ -1054,6 +1076,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   // Insert to lookup cache
   for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
     Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr);
+    FEXCore::FH6Stats::NoteBlock(GuestAddr, reinterpret_cast<uint64_t>(HostAddr));
   }
 
   // Clear any relocations that might have been generated
@@ -1093,6 +1116,7 @@ bool ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length
   FEXCORE_PROFILE_SCOPED("InvalidateCodeBuffersCodeRange");
 
   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+  const uint64_t InvalidateStart = FEXCore::FH6Stats::Ticks();
   bool HadCode = false;
   std::scoped_lock lk {CodeBufferListLock};
   auto it = CodeBufferList.begin();
@@ -1104,6 +1128,8 @@ bool ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length
       it = CodeBufferList.erase(it);
     }
   }
+  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::IntervalInvalidate);
+  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::IntervalInvalidateTicks, FEXCore::FH6Stats::Ticks() - InvalidateStart);
   return HadCode;
 }
 
@@ -1146,6 +1172,9 @@ void ContextImpl::InvalidateThreadUntrackedCodeRange(FEXCore::Core::InternalThre
 void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
   auto Thread = Frame->Thread;
   auto CTX = static_cast<ContextImpl*>(Thread->CTX);
+
+  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::SMCMismatch);
+  FEXCore::FH6Stats::NoteSMC(GuestRIP & ~0xFFFULL, GuestRIP);
 
   if (CTX->Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL) {
     // Every block compiled from writable code validates its own bytes on entry, so a thread that

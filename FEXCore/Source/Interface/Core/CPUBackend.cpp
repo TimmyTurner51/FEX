@@ -7,6 +7,7 @@
 
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/AllocatorHooks.h>
+#include <FEXCore/Utils/FH6Stats.h>
 #include <FEXCore/Utils/PrctlUtils.h>
 
 #include <cstdint>
@@ -332,6 +333,7 @@ namespace CPU {
   fextl::shared_ptr<CodeBuffer> CPUBackend::CheckCodeBufferUpdate() {
     auto NewCodeBuffer = SharedCodeBuffers.GetLatest();
     if (CurrentCodeBuffer != NewCodeBuffer) {
+      FEXCore::FH6Stats::Add(FEXCore::FH6Stats::CodeBufferUpdates);
       RegisterForSignalHandler(CurrentCodeBuffer);
       return std::exchange(CurrentCodeBuffer, NewCodeBuffer);
     }

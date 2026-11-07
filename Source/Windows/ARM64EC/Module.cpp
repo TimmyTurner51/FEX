@@ -23,6 +23,7 @@ $end_info$
 #include <FEXCore/Utils/EnumOperators.h>
 #include <FEXCore/Utils/EnumUtils.h>
 #include <FEXCore/Utils/FPState.h>
+#include <FEXCore/Utils/FH6Stats.h>
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/TypeDefines.h>
@@ -57,11 +58,159 @@ $end_info$
 #include <optional>
 #include <unordered_map>
 #include <utility>
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <vector>
 #include <ntstatus.h>
 #include <windef.h>
 #include <winternl.h>
 #include <winnt.h>
 #include <wine/debug.h>
+
+// FEX_FH6_STATS=1: every 10 s, rewrites Download/fh6_stats-<pid>.txt with one line per period of
+// the cumulative FEXCore::FH6Stats counters ("t <seconds> c0 c1 ..."), after a "cntfrq" line.
+// Also rewrites Download/fh6_smc-<pid>.txt with the 64 guest pages whose blocks failed their
+// in-block code check most often ("page count lastblock", cumulative).
+namespace FH6StatsWriter {
+struct PidPath {
+  wchar_t Path[112];
+  UNICODE_STRING Name;
+
+  explicit PidPath(const wchar_t* Prefix, const wchar_t* Suffix = L".txt") {
+    size_t N = 0;
+    for (; Prefix[N]; ++N) {
+      Path[N] = Prefix[N];
+    }
+    wchar_t Digits[12];
+    size_t D = 0;
+    for (uint32_t Pid = GetCurrentProcessId(); Pid || !D; Pid /= 10) {
+      Digits[D++] = L'0' + Pid % 10;
+    }
+    while (D) {
+      Path[N++] = Digits[--D];
+    }
+    for (const wchar_t* S = Suffix; *S; ++S) {
+      Path[N++] = *S;
+    }
+    Path[N] = 0;
+    Name = {.Length = static_cast<USHORT>(N * sizeof(wchar_t)), .MaximumLength = static_cast<USHORT>((N + 1) * sizeof(wchar_t)), .Buffer = Path};
+  }
+
+  void Write(const fextl::string& Out) {
+    Write(Out.data(), Out.size());
+  }
+
+  void Write(const void* Data, size_t Size, bool Append = false) {
+    OBJECT_ATTRIBUTES Attributes;
+    InitializeObjectAttributes(&Attributes, &Name, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+    HANDLE File;
+    IO_STATUS_BLOCK IOSB;
+    if (NtCreateFile(&File, (Append ? FILE_APPEND_DATA : GENERIC_WRITE) | SYNCHRONIZE, &Attributes, &IOSB, nullptr, FILE_ATTRIBUTE_NORMAL,
+                     0, Append ? FILE_OPEN_IF : FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, nullptr, 0)) {
+      return;
+    }
+    DWORD Written;
+    WriteFile(File, Data, static_cast<DWORD>(Size), &Written, nullptr);
+    NtClose(File);
+  }
+};
+
+static fextl::string FormatSMC() {
+  fextl::vector<std::array<uint64_t, 3>> Rows;
+  for (size_t i = 1; i < FEXCore::FH6Stats::SMCSlots; ++i) {
+    const uint64_t Rip = __atomic_load_n(&fh6_smc[i][0], __ATOMIC_RELAXED);
+    if (Rip) {
+      Rows.push_back({Rip, __atomic_load_n(&fh6_smc[i][1], __ATOMIC_RELAXED), __atomic_load_n(&fh6_smc[i][2], __ATOMIC_RELAXED)});
+    }
+  }
+  std::sort(Rows.begin(), Rows.end(), [](const auto& A, const auto& B) { return A[1] > B[1]; });
+  fextl::string Out = fextl::fmt::format("entries {} overflow {}\n", Rows.size(), __atomic_load_n(&fh6_smc[0][1], __ATOMIC_RELAXED));
+  for (size_t i = 0; i < Rows.size() && i < 64; ++i) {
+    Out += fextl::fmt::format("{:x} {} {:x}\n", Rows[i][0], Rows[i][1], Rows[i][2]);
+  }
+  const uint64_t BadRip = __atomic_load_n(&fh6_clone_bad_info[0], __ATOMIC_ACQUIRE);
+  if (BadRip && BadRip != ~0ULL) {
+    Out += fextl::fmt::format("clonebad rip {:x} copy {} compiled {} diff {:x}\n", BadRip, fh6_clone_bad_info[1], fh6_clone_bad_info[2],
+                              fh6_clone_bad_info[3]);
+    for (size_t Image = 0; Image < 2; ++Image) {
+      const size_t Size = std::min<uint64_t>(fh6_clone_bad_info[Image + 1], 1024);
+      Out += Image ? "compiled" : "copy";
+      for (size_t i = 0; i < Size; i += 4) {
+        uint32_t Word;
+        memcpy(&Word, &fh6_clone_bad[Image][i], sizeof(Word));
+        Out += fextl::fmt::format(" {:08x}", Word);
+      }
+      Out += "\n";
+    }
+  }
+  for (const auto& Row : fh6_shape) {
+    const uint64_t Rip = __atomic_load_n(&Row[0], __ATOMIC_ACQUIRE);
+    if (!Rip) {
+      continue;
+    }
+    Out += fextl::fmt::format("shape rip {:x} blocks {} insns {} bsize {} len {} entries {} bytes", Rip, Row[1], Row[2], Row[3], Row[4], Row[5]);
+    const auto* Bytes = reinterpret_cast<const uint8_t*>(&Row[6]);
+    for (size_t i = 0; i < std::min<uint64_t>(Row[4], 32); ++i) {
+      Out += fextl::fmt::format(" {:02x}", Bytes[i]);
+    }
+    Out += "\n";
+  }
+  return Out;
+}
+
+static void* Run(void*) {
+  PidPath Stats(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_stats-");
+  PidPath SMC(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_smc-");
+  PidPath Blocks(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_blocks-", L".bin");
+  uint64_t BlocksWritten = 0;
+
+  uint64_t Freq;
+  __asm volatile("mrs %0, cntfrq_el0" : "=r"(Freq));
+  fextl::string Out = fextl::fmt::format("cntfrq {}\n", Freq);
+  LARGE_INTEGER Period {.QuadPart = -100000000LL};
+  for (uint64_t Seconds = 10;; Seconds += 10) {
+    NtDelayExecution(false, &Period);
+    Out += fextl::fmt::format("t {}", Seconds);
+    for (size_t i = 0; i < FEXCore::FH6Stats::NumCounters; ++i) {
+      Out += fextl::fmt::format(" {}", __atomic_load_n(&fh6_stats[i], __ATOMIC_RELAXED));
+    }
+    Out += "\n";
+    Stats.Write(Out);
+    SMC.Write(FormatSMC());
+    constexpr uint64_t Slots = FEXCore::FH6Stats::BlockMapSlots;
+    const uint64_t Count = __atomic_load_n(&fh6_blockmap_count, __ATOMIC_ACQUIRE);
+    if (fh6_blockmap && Count != BlocksWritten) {
+      // Entries older than one lap of the ring were overwritten before we got to them.
+      uint64_t From = Count - BlocksWritten > Slots ? Count - Slots : BlocksWritten;
+      bool Append = BlocksWritten != 0;
+      while (From != Count) {
+        const uint64_t Slot = From & (Slots - 1);
+        const uint64_t N = std::min(Count - From, Slots - Slot);
+        Blocks.Write(&fh6_blockmap[Slot], N * sizeof(fh6_blockmap[0]), Append);
+        Append = true;
+        From += N;
+      }
+      BlocksWritten = Count;
+    }
+  }
+  return nullptr;
+}
+
+static void Start() {
+  const char* Env = std::getenv("FEX_FH6_STATS");
+  if (!Env || Env[0] != '1') {
+    return;
+  }
+  void* Map = nullptr;
+  SIZE_T MapSize = FEXCore::FH6Stats::BlockMapSlots * sizeof(fh6_blockmap[0]);
+  if (!NtAllocateVirtualMemory(NtCurrentProcess(), &Map, 0, &MapSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) {
+    __atomic_store_n(&fh6_blockmap, static_cast<uint64_t(*)[2]>(Map), __ATOMIC_RELEASE);
+  }
+  static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
+  Thread = FEXCore::Threads::Thread::Create(Run, nullptr, {.Internal = true}, "FH6Stats");
+}
+} // namespace FH6StatsWriter
 
 namespace Exception {
 class ECSyscallHandler;
@@ -721,6 +870,8 @@ NTSTATUS ProcessInit() {
     LogMan::Msg::IFmt("[{}][{}] Sleeping for {} seconds", GetCurrentProcessId(), AppConfigName, StartupSleep());
     std::this_thread::sleep_for(std::chrono::seconds(StartupSleep()));
   }
+
+  FH6StatsWriter::Start();
 
   return STATUS_SUCCESS;
 }
