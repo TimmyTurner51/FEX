@@ -167,8 +167,100 @@ static fextl::string FormatSMC() {
   return Out;
 }
 
+extern "C" NTSTATUS WINAPI NtGetNextThread(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG, HANDLE*);
+extern "C" NTSTATUS WINAPI NtResumeThread(HANDLE, PULONG);
+extern "C" NTSTATUS WINAPI NtReadVirtualMemory(HANDLE, const void*, void*, SIZE_T, SIZE_T*);
+
+// FEX_FH6_SPINSAMPLE=1: threads that used more than 80% of a period's wall time get suspended a few
+// times and their guest rip, rsp and code bytes appended to Download/fh6_spin-<pid>.txt.
+struct SpinSampler {
+  static constexpr size_t MaxThreads = 512;
+  struct Entry {
+    uint64_t Tid;
+    uint64_t UserTime;
+  };
+  Entry Prev[MaxThreads] {};
+  size_t PrevCount {};
+
+  uint64_t LastTime(uint64_t Tid) const {
+    for (size_t i = 0; i < PrevCount; ++i) {
+      if (Prev[i].Tid == Tid) {
+        return Prev[i].UserTime;
+      }
+    }
+    return ~0ULL;
+  }
+
+  fextl::string Sample(uint64_t Seconds, uint64_t PeriodTicks100ns) {
+    fextl::string Out;
+    Entry Cur[MaxThreads];
+    size_t CurCount = 0;
+    HANDLE Thread = nullptr;
+    HANDLE Next;
+    while (!NtGetNextThread(NtCurrentProcess(), Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, 0, &Next)) {
+      if (Thread) {
+        NtClose(Thread);
+      }
+      Thread = Next;
+      THREAD_BASIC_INFORMATION Info;
+      KERNEL_USER_TIMES Times;
+      if (NtQueryInformationThread(Thread, ThreadBasicInformation, &Info, sizeof(Info), nullptr) ||
+          NtQueryInformationThread(Thread, ThreadTimes, &Times, sizeof(Times), nullptr)) {
+        continue;
+      }
+      const uint64_t Tid = reinterpret_cast<uint64_t>(Info.ClientId.UniqueThread);
+      const uint64_t User = Times.UserTime.QuadPart;
+      if (CurCount < MaxThreads) {
+        Cur[CurCount++] = {Tid, User};
+      }
+      const uint64_t Before = LastTime(Tid);
+      if (Tid == GetCurrentThreadId() || Before == ~0ULL || User - Before < PeriodTicks100ns * 8 / 10) {
+        continue;
+      }
+      constexpr size_t Samples = 8;
+      uint64_t Rip[Samples] {}, Rsp[Samples] {};
+      for (size_t s = 0; s < Samples; ++s) {
+        if (NtSuspendThread(Thread, nullptr)) {
+          break;
+        }
+        CONTEXT Ctx {};
+        Ctx.ContextFlags = CONTEXT_CONTROL;
+        if (!NtGetContextThread(Thread, &Ctx)) {
+          Rip[s] = Ctx.Rip;
+          Rsp[s] = Ctx.Rsp;
+        }
+        NtResumeThread(Thread, nullptr);
+        LARGE_INTEGER Gap {.QuadPart = -50000LL};
+        NtDelayExecution(false, &Gap);
+      }
+      Out += fextl::fmt::format("t {} tid {} user_ms {}", Seconds, Tid, (User - Before) / 10000);
+      for (size_t s = 0; s < Samples; ++s) {
+        Out += fextl::fmt::format(" {:x}/{:x}", Rip[s], Rsp[s]);
+      }
+      uint8_t Bytes[48] {};
+      SIZE_T Read = 0;
+      NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Rip[0] & ~0xFULL), Bytes, sizeof(Bytes), &Read);
+      Out += fextl::fmt::format(" code@{:x}", Rip[0] & ~0xFULL);
+      for (size_t i = 0; i < Read; ++i) {
+        Out += fextl::fmt::format(" {:02x}", Bytes[i]);
+      }
+      Out += "\n";
+    }
+    if (Thread) {
+      NtClose(Thread);
+    }
+    __builtin_memcpy(Prev, Cur, CurCount * sizeof(Entry));
+    PrevCount = CurCount;
+    return Out;
+  }
+};
+
 static void* Run(void*) {
   PidPath Stats(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_stats-");
+  PidPath Spin(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_spin-");
+  const char* SpinEnv = std::getenv("FEX_FH6_SPINSAMPLE");
+  static SpinSampler Sampler;
+  const bool SampleSpins = SpinEnv && SpinEnv[0] == '1';
   PidPath SMC(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_smc-");
   PidPath Blocks(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_blocks-", L".bin");
   uint64_t BlocksWritten = 0;
@@ -186,6 +278,12 @@ static void* Run(void*) {
     Out += "\n";
     Stats.Write(Out);
     SMC.Write(FormatSMC());
+    if (SampleSpins) {
+      const auto Spins = Sampler.Sample(Seconds, 100000000ULL);
+      if (!Spins.empty()) {
+        Spin.Write(Spins.data(), Spins.size(), true);
+      }
+    }
     constexpr uint64_t Slots = FEXCore::FH6Stats::BlockMapSlots;
     const uint64_t Count = __atomic_load_n(&fh6_blockmap_count, __ATOMIC_ACQUIRE);
     if (fh6_blockmap && Count != BlocksWritten) {
