@@ -346,7 +346,6 @@ struct JITPointers {
   uint64_t XCRFunction {};
   uint64_t SyscallHandlerObj {};
   uint64_t SyscallHandlerFunc {};
-  uint64_t GuestExceptionRaiseFunc {};
   uint64_t ExitFunctionLink {};
   uint64_t MonoBackpatcherWrite {};
   uint64_t LUDIV {};

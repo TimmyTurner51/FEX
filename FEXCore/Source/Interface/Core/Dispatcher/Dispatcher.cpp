@@ -26,7 +26,6 @@
 
 #include <array>
 #include <bit>
-#include <cstdlib>
 #include <cstring>
 
 namespace FEXCore::CPU {
@@ -404,22 +403,6 @@ void Dispatcher::EmitDispatcher() {
     GuestSignal_SIGILL = GetCursorAddress<uint64_t>();
 
     SpillStaticRegs(TMP1);
-
-#ifdef ARCHITECTURE_arm64ec
-    // FEX_FH6_FASTUD=1: the host SIGILL is not an x64 event. Raise the pending
-    // SynchronousFaultData through NtRaiseException with the packed guest
-    // context, same first-chance dispatch as the hlt path.
-    static const bool FastUD = [] {
-      const char* Env = std::getenv("FEX_FH6_FASTUD");
-      return Env && Env[0] == '1';
-    }();
-    if (FastUD) {
-      ldr(ARMEmitter::XReg::x0, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.SyscallHandlerObj));
-      ldr(ARMEmitter::XReg::x3, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestExceptionRaiseFunc));
-      mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, STATE.R());
-      blr(ARMEmitter::Reg::r3);
-    }
-#endif
 
     hlt(0);
   }
