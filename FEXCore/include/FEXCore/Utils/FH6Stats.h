@@ -4,7 +4,7 @@
 
 // Process-wide event counters for translation churn. Written by FEX::Windows when
 // FEX_FH6_STATS=1; counting is always on and only happens on slow paths.
-extern "C" uint64_t fh6_stats[55];
+extern "C" uint64_t fh6_stats[56];
 extern "C" uint64_t fh6_pool_keys[65536];
 // First clone/compile mismatch: {guest rip, copy size, compiled size, first differing offset}, then both images.
 extern "C" uint64_t fh6_clone_bad_info[4];
@@ -75,7 +75,8 @@ enum Counter : uint32_t {
   LinkSharedMismatch = 52,     // ... returned without linking: shared map holds another block
   LinkMade = 53,               // links written (direct branch or far HostCode pointer)
   LinkAdopted = 54,            // ... to the shared map's block after dropping a stale L1 copy
-  NumCounters = 55,
+  PoolReuseHits = 55,          // pool stubs mapped back to an earlier translation of the same slot bytes
+  NumCounters = 56,
 };
 
 // SMC mismatch histogram keyed by guest page: {page, count, last block entry}. Open
