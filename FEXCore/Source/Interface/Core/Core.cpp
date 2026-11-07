@@ -509,7 +509,7 @@ void ContextImpl::OnCodeBufferAllocated(const fextl::shared_ptr<CPU::CodeBuffer>
 }
 
 extern "C" {
-uint64_t fh6_stats[56] {};
+uint64_t fh6_stats[55] {};
 uint64_t fh6_pool_keys[65536] {};
 uint64_t fh6_clone_bad_info[4] {};
 uint8_t fh6_clone_bad[2][1024] {};
@@ -579,69 +579,6 @@ void StorePoolTemplate(uint64_t Key, fextl::shared_ptr<const PoolTemplate> Templ
     Shard.Map.clear();
   }
   Shard.Map[Key] = std::move(Template);
-}
-
-// Slots get rewritten back to bytes they held before. A translation made for the same slot and bytes
-// is still valid code: retained code buffers are never freed, and links out of it are severed when
-// their targets go. Only a code cache clear drops link records without severing them, so entries from
-// an older generation are ignored.
-struct PoolReuseEntry {
-  uint64_t Entry;
-  uint64_t Target;
-  uintptr_t Host;
-  uint32_t Generation;
-  uint8_t InsnLen;
-  bool Writable;
-  std::array<uint8_t, MaxX86InstSize> Insn;
-};
-
-struct PoolReuseShard {
-  std::mutex Mutex;
-  fextl::unordered_map<uint64_t, PoolReuseEntry> Map;
-};
-constexpr size_t PoolReuseShardLimit = 4096;
-PoolReuseShard PoolReuse[PoolShards];
-std::atomic<uint32_t> PoolReuseGeneration {};
-
-uint64_t PoolReuseKey(uint64_t Entry, uint64_t ContentKey) {
-  return ContentKey ^ (Entry * 0x9E3779B97F4A7C15ULL);
-}
-
-uintptr_t FindPoolReuse(uint64_t Entry, uint64_t ContentKey, const uint8_t* Insn, uint64_t InsnLen, uint64_t Target, bool Writable) {
-  const uint64_t Key = PoolReuseKey(Entry, ContentKey);
-  auto& Shard = PoolReuse[Key % PoolShards];
-  std::scoped_lock Lock(Shard.Mutex);
-  auto It = Shard.Map.find(Key);
-  if (It == Shard.Map.end()) {
-    return 0;
-  }
-  const auto& E = It->second;
-  if (E.Entry != Entry || E.Target != Target || E.InsnLen != InsnLen || E.Writable != Writable ||
-      E.Generation != PoolReuseGeneration.load(std::memory_order_relaxed) || memcmp(E.Insn.data(), Insn, InsnLen) != 0) {
-    return 0;
-  }
-  return E.Host;
-}
-
-// Generation is read before the translation was made, so a clear during its compile retires it.
-void StorePoolReuse(uint64_t Entry, uint64_t ContentKey, const uint8_t* Insn, uint64_t InsnLen, uint64_t Target, bool Writable,
-                    uintptr_t Host, uint32_t Generation) {
-  PoolReuseEntry E {
-    .Entry = Entry,
-    .Target = Target,
-    .Host = Host,
-    .Generation = Generation,
-    .InsnLen = static_cast<uint8_t>(InsnLen),
-    .Writable = Writable,
-  };
-  memcpy(E.Insn.data(), Insn, InsnLen);
-  const uint64_t Key = PoolReuseKey(Entry, ContentKey);
-  auto& Shard = PoolReuse[Key % PoolShards];
-  std::scoped_lock Lock(Shard.Mutex);
-  if (Shard.Map.size() >= PoolReuseShardLimit) {
-    Shard.Map.clear();
-  }
-  Shard.Map[Key] = E;
 }
 
 // Value of a padded 64-bit constant load (movz/movk/nop), as emitted for relocatable constants.
@@ -849,7 +786,6 @@ fextl::shared_ptr<PoolTemplate> MakePoolTemplate(const Frontend::Decoder::Decode
 void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer) {
   FEXCORE_PROFILE_INSTANT("ClearCodeCache");
   FEXCore::FH6Stats::Add(NewCodeBuffer ? FEXCore::FH6Stats::ClearCacheNewBuffer : FEXCore::FH6Stats::ClearCacheKeepBuffer);
-  PoolReuseGeneration.fetch_add(1, std::memory_order_relaxed);
 
   if (NewCodeBuffer) {
     // Allocate new CodeBuffer + L3 LookupCache and clear L1+L2 caches
@@ -1284,23 +1220,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     RangeInfo = SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP);
   }
   const bool PoolCandidate = RangeInfo.Size != 0;
-  const uint32_t ReuseGeneration = PoolReuseGeneration.load(std::memory_order_relaxed);
   auto& PoolCopy = Thread->PoolCopy;
   auto& PoolCopySize = Thread->PoolCopySize;
   PoolCopySize = 0;
-  const auto MapPoolStub = [&](uint64_t InsnLen, uint64_t Target, uintptr_t Host) {
-    const std::array<uint64_t, 1> Entry {GuestRIP};
-    const uint64_t LastByte = GuestRIP + InsnLen + (Target ? 5 : 0) - 1;
-    const std::array<uint64_t, 2> Pages {GuestRIP & FEXCore::Utils::FEX_PAGE_MASK, LastByte & FEXCore::Utils::FEX_PAGE_MASK};
-    const size_t NumPages = Pages[0] == Pages[1] ? 1 : 2;
-    for (size_t i = 0; i < NumPages; ++i) {
-      if (Thread->LookupCache->AddBlockExecutableRange(Thread, Entry, Pages[i], FEXCore::Utils::FEX_PAGE_SIZE)) {
-        SyscallHandler->MarkGuestExecutableRange(Thread, Pages[i], FEXCore::Utils::FEX_PAGE_SIZE);
-      }
-    }
-    Thread->LookupCache->AddBlockMapping(Thread, GuestRIP, std::span<const uint64_t>(Pages.data(), NumPages), reinterpret_cast<void*>(Host));
-    FEXCore::FH6Stats::NoteBlock(GuestRIP, Host);
-  };
   if (PoolCandidate) {
     // One snapshot of the slot: the template match and the entry CRC must describe the same bytes.
     std::array<uint8_t, MaxX86InstSize + 5> Snapshot;
@@ -1320,13 +1242,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
     for (size_t Candidate = 0; Candidate < NumCandidates; ++Candidate) {
       const auto [InsnLen, Target] = Candidates[Candidate];
-      const uint64_t ContentKey = PoolKey(Snapshot.data(), InsnLen, Target);
-      if (const auto Host = FindPoolReuse(GuestRIP, ContentKey, Snapshot.data(), InsnLen, Target, RangeInfo.Writable)) {
-        MapPoolStub(InsnLen, Target, Host);
-        FEXCore::FH6Stats::Add(FEXCore::FH6Stats::PoolReuseHits);
-        return Host;
-      }
-      const auto Template = FindPoolTemplate(ContentKey);
+      const auto Template = FindPoolTemplate(PoolKey(Snapshot.data(), InsnLen, Target));
       if (!Template || Template->InsnLen != InsnLen || Template->Target != Target || Template->Writable != RangeInfo.Writable ||
           memcmp(Template->Insn.data(), Snapshot.data(), InsnLen) != 0) {
         continue;
@@ -1345,12 +1261,21 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       if (!Loaded.BlockBegin) {
         break;
       }
-      const auto Host = reinterpret_cast<uintptr_t>(Loaded.BlockBegin + Template->EntryOffset);
-      MapPoolStub(InsnLen, Target, Host);
-      StorePoolReuse(GuestRIP, ContentKey, Snapshot.data(), InsnLen, Target, RangeInfo.Writable, Host, ReuseGeneration);
+      const std::array<uint64_t, 1> Entry {GuestRIP};
+      const uint64_t LastByte = GuestRIP + InsnLen + (Target ? 5 : 0) - 1;
+      const std::array<uint64_t, 2> Pages {GuestRIP & FEXCore::Utils::FEX_PAGE_MASK, LastByte & FEXCore::Utils::FEX_PAGE_MASK};
+      const size_t NumPages = Pages[0] == Pages[1] ? 1 : 2;
+      for (size_t i = 0; i < NumPages; ++i) {
+        if (Thread->LookupCache->AddBlockExecutableRange(Thread, Entry, Pages[i], FEXCore::Utils::FEX_PAGE_SIZE)) {
+          SyscallHandler->MarkGuestExecutableRange(Thread, Pages[i], FEXCore::Utils::FEX_PAGE_SIZE);
+        }
+      }
+      void* Host = Loaded.BlockBegin + Template->EntryOffset;
+      Thread->LookupCache->AddBlockMapping(Thread, GuestRIP, std::span<const uint64_t>(Pages.data(), NumPages), Host);
+      FEXCore::FH6Stats::NoteBlock(GuestRIP, reinterpret_cast<uint64_t>(Host));
       FEXCore::FH6Stats::Add(FEXCore::FH6Stats::PoolCloneHits);
       FEXCore::FH6Stats::Add(FEXCore::FH6Stats::JITHostBytes, CopySize);
-      return Host;
+      return reinterpret_cast<uintptr_t>(Host);
     }
   }
 
@@ -1518,8 +1443,6 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
     if (auto Template = MakePoolTemplate(*Thread->FrontendDecoder->GetDecodedBlockInfo(), GuestRIP, Length, RangeInfo.Writable, CompiledCode, Relocs)) {
       const uint64_t Key = PoolKey(Template->Insn.data(), Template->InsnLen, Template->Target);
-      StorePoolReuse(GuestRIP, Key, Template->Insn.data(), Template->InsnLen, Template->Target, RangeInfo.Writable,
-                     reinterpret_cast<uintptr_t>(CodePtr), ReuseGeneration);
       StorePoolTemplate(Key, std::move(Template));
       FEXCore::FH6Stats::Add(FEXCore::FH6Stats::PoolTemplatesStored);
     }
