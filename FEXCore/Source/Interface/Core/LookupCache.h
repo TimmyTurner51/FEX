@@ -20,6 +20,9 @@
 #include <mutex>
 
 namespace FEXCore {
+// Patched callsites from Erase; JIT.cpp runs dc / dsb / ic / dsb / isb once.
+void FlushPendingDelinkICache();
+
 struct LookupCacheBaseLockToken {
 protected:
   // Protected constructor - only derived classes can construct
@@ -121,6 +124,7 @@ struct GuestToHostMap {
     for (auto it = lower; it != upper; it = BlockLinks->erase(it)) {
       it->second(it->first.HostLink);
     }
+    FlushPendingDelinkICache();
 
     // Remove from BlockList
     return BlockList.erase(Address) != 0;

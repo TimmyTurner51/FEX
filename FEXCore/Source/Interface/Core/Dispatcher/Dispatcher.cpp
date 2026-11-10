@@ -555,6 +555,47 @@ void Dispatcher::EmitDispatcher() {
     // It's also the end of block and RIP might have changed, so we jump directly to the top of the loop.
     ThreadDispatchRemoveCodeEntry = GetCursorAddress<uint64_t>();
 
+    // x1 is the guest RIP. Protector UD2 should not compile; skip the C++
+    // invalidate so the original host stays cached. Peeking here (one stub)
+    // rather than in ValidateCode, which died before title (07e58a28).
+    //
+    // Occupying this core until bytes return (hbwfe 23f0ce84) lived with
+    // highway AVG 53 / 1% 26.7. Raising FASTUD here (fd27be3f) reached
+    // in-world AVG 53 then died_after_drive. Wait, do not raise.
+    ARMEmitter::ForwardLabel DoRemove;
+    ARMEmitter::ForwardLabel AfterFill;
+    ARMEmitter::ForwardLabel WaitEntryDone;
+    ARMEmitter::BiDirectionalLabel WaitEntry {};
+    ARMEmitter::BackwardLabel WaitChunk;
+    // x1 = block entry (C++ GuestRIP). x10 = failing chunk. Do not wait with
+    // x1=chunk (08a07dad died). Do not scan (d715b412 / 90f4af37). Do not use x2.
+    // WaitEntry skip-C++ lives. Wait then C++ on entry died_after_drive (e1ab9d17)
+    // even with cherry 1% 43.
+    LoadConstant(ARMEmitter::Size::i32Bit, ARMEmitter::Reg::r11, 0x0B0F);
+    ldrh(ARMEmitter::WReg::w12, ARMEmitter::XReg::x1, 0);
+    cmp(ARMEmitter::Size::i32Bit, ARMEmitter::Reg::r12, ARMEmitter::Reg::r11);
+    (void)b(ARMEmitter::Condition::CC_EQ, &WaitEntry);
+    ldrh(ARMEmitter::WReg::w12, ARMEmitter::XReg::x10, 0);
+    cmp(ARMEmitter::Size::i32Bit, ARMEmitter::Reg::r12, ARMEmitter::Reg::r11);
+    (void)b(ARMEmitter::Condition::CC_NE, &DoRemove);
+    (void)Bind(&WaitChunk);
+    ldrh(ARMEmitter::WReg::w12, ARMEmitter::XReg::x10, 0);
+    cmp(ARMEmitter::Size::i32Bit, ARMEmitter::Reg::r12, ARMEmitter::Reg::r11);
+    (void)b(ARMEmitter::Condition::CC_EQ, &WaitChunk);
+    (void)b(&DoRemove);
+    (void)Bind(&WaitEntry);
+    ldrh(ARMEmitter::WReg::w12, ARMEmitter::XReg::x1, 0);
+    cmp(ARMEmitter::Size::i32Bit, ARMEmitter::Reg::r12, ARMEmitter::Reg::r11);
+    (void)b(ARMEmitter::Condition::CC_EQ, &WaitEntry);
+    (void)Bind(&WaitEntryDone);
+    FillStaticRegs({
+      .OptionalReg = ARMEmitter::Reg::r1,
+      .OptionalReg2 = ARMEmitter::Reg::r2,
+      .FPRs = false,
+    });
+    (void)b(&AfterFill);
+    (void)Bind(&DoRemove);
+
     // Arguments are already in x0, x1. Just jump to the handler.
     ldr(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.ThreadRemoveCodeEntryFromJIT));
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
@@ -562,11 +603,11 @@ void Dispatcher::EmitDispatcher() {
     } else {
       blr(ARMEmitter::Reg::r2);
     }
-
     FillStaticRegs({
       .OptionalReg = ARMEmitter::Reg::r1,
       .OptionalReg2 = ARMEmitter::Reg::r2,
     });
+    (void)Bind(&AfterFill);
 
     // Now go back to the regular dispatcher loop
     (void)b(&LoopTop);

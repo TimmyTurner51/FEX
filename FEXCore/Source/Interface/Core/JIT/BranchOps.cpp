@@ -374,20 +374,18 @@ DEF_OP(ValidateCode) {
 DEF_OP(ThreadRemoveCodeEntry) {
   auto Op = IROp->C<IR::IROp_ThreadRemoveCodeEntry>();
 
+  // Copy before spill: TMP1 (x10) is the spill scratch. x12/x13 are not SRA.
+  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r12, GetReg(Op->EntryToInvalidate));
+  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r13, GetReg(Op->NewRIP));
+
   SpillStaticRegs(TMP1);
 
-  // Store the new RIP to go to.
-  str(GetReg(Op->NewRIP).X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
-
-  // Move the entry to ABI before saving state.
-  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, GetReg(Op->EntryToInvalidate));
-
-  // Arguments are passed as follows:
-  // X0: Thread
-  // X1: RIPToInvalidate
+  // x1 is the block to drop. x10 is the failing chunk (may equal x1).
+  str(ARMEmitter::XReg::x12, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, ARMEmitter::Reg::r12);
+  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r10, ARMEmitter::Reg::r13);
   mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, STATE.R());
 
-  // Jump to the invalidate dispatch handler. We won't return after this.
   ldr(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.ThreadDispatchRemoveCodeEntry));
   br(ARMEmitter::XReg::x2);
 }

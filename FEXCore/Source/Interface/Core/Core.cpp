@@ -926,7 +926,12 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           // that failed stayed cached, failed again on the next entry, and the function was
           // recompiled on every pass.
           auto BlockRip = Thread->OpDispatcher->_EntrypointOffset(GPRSize, Block.Entry - GuestRIP);
-          Thread->OpDispatcher->_ThreadRemoveCodeEntry(BlockRip, BlockRip);
+          // Entry stays the block (x1 / C++ GuestRIP). NewRIP carries the failing
+          // chunk so the dispatcher can wait on it in x10. Skip-C++ after that
+          // wait died even on original halfword (5ebd0715) and full CRC (ccbf7f81).
+          // Full-CRC wait then C++ died_after_drive (3618066c).
+          // Prologue 2-byte chunks died_after_drive with in-world beat (57e50026).
+          Thread->OpDispatcher->_ThreadRemoveCodeEntry(BlockRip, addr);
           auto next = Thread->OpDispatcher->CreateNewCodeBlockAfter(current);
           Thread->OpDispatcher->SetFalseJumpTarget(mismatch, next);
           Thread->OpDispatcher->SetCurrentCodeBlock(next);

@@ -35,6 +35,7 @@ $end_info$
 #include <FEXCore/Utils/FH6Stats.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <optional>
@@ -112,6 +113,52 @@ static void PrintVectorValue(uint64_t Value, uint64_t ValueUpper) {
   LogMan::Msg::DFmt("Value: 0x{:016x}'{:016x}", ValueUpper, Value);
 }
 } // namespace
+
+namespace {
+void* PendingDelinkICache[4096];
+size_t PendingDelinkCount {};
+}
+
+namespace FEXCore {
+void FlushPendingDelinkICache() {
+  if (PendingDelinkCount == 0) {
+    return;
+  }
+#if defined(ARCHITECTURE_arm64)
+  // dc/ic operate on the containing line. Duplicate callsites in the same
+  // 64-byte line were the C++ hitch after WaitChunk. Keep the flush under the
+  // lock (4680774b moved it after unlock and died). Do not use
+  // FlushInstructionCache (hbbulk3/4 died).
+  for (size_t i = 0; i < PendingDelinkCount; ++i) {
+    PendingDelinkICache[i] =
+      reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(PendingDelinkICache[i]) & ~uintptr_t(63));
+  }
+  std::sort(PendingDelinkICache, PendingDelinkICache + PendingDelinkCount);
+  size_t Unique = 1;
+  for (size_t i = 1; i < PendingDelinkCount; ++i) {
+    if (PendingDelinkICache[i] != PendingDelinkICache[Unique - 1]) {
+      PendingDelinkICache[Unique++] = PendingDelinkICache[i];
+    }
+  }
+  PendingDelinkCount = Unique;
+  for (size_t i = 0; i < PendingDelinkCount; ++i) {
+    auto Addr = reinterpret_cast<uintptr_t>(PendingDelinkICache[i]);
+    __asm__ volatile("dc cvau, %0" : : "r"(Addr) : "memory");
+  }
+  __asm__ volatile("dsb ish" : : : "memory");
+  for (size_t i = 0; i < PendingDelinkCount; ++i) {
+    auto Addr = reinterpret_cast<uintptr_t>(PendingDelinkICache[i]);
+    __asm__ volatile("ic ivau, %0" : : "r"(Addr) : "memory");
+  }
+  __asm__ volatile("dsb ish\n\tisb" : : : "memory");
+#else
+  for (size_t i = 0; i < PendingDelinkCount; ++i) {
+    ARMEmitter::Emitter::ClearICache(PendingDelinkICache[i], 4);
+  }
+#endif
+  PendingDelinkCount = 0;
+}
+} // namespace FEXCore
 
 namespace FEXCore::CPU {
 
@@ -548,7 +595,10 @@ static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, 
   }
 
   std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(CallerAddress)).store(BranchInst, std::memory_order::relaxed);
-  ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(CallerAddress), 4);
+  if (PendingDelinkCount == 4096) {
+    FEXCore::FlushPendingDelinkICache();
+  }
+  PendingDelinkICache[PendingDelinkCount++] = reinterpret_cast<void*>(CallerAddress);
 }
 
 static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record) {
@@ -559,7 +609,10 @@ static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record
   BranchEmit.b(0x2);
 
   std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(JumpThunkStartAddress)).store(BranchInst, std::memory_order::relaxed);
-  ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
+  if (PendingDelinkCount == 4096) {
+    FEXCore::FlushPendingDelinkICache();
+  }
+  PendingDelinkICache[PendingDelinkCount++] = reinterpret_cast<void*>(JumpThunkStartAddress);
 
   // No need to reset HostCode here as the exit linker pointer is stored separately, and if the block is relinked it will be updated.
 }
