@@ -922,8 +922,11 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->SetTrueJumpTarget(mismatch, fail);
           Thread->OpDispatcher->SetCurrentCodeBlock(fail);
           Thread->OpDispatcher->StartNewBlock();
-          Thread->OpDispatcher->_ThreadRemoveCodeEntry(Thread->OpDispatcher->_EntrypointOffset(GPRSize, 0),
-                                                        Thread->OpDispatcher->_EntrypointOffset(GPRSize, Block.Entry - GuestRIP));
+          // Drop the block whose bytes changed. Offset 0 is the function entry, so the block
+          // that failed stayed cached, failed again on the next entry, and the function was
+          // recompiled on every pass.
+          auto BlockRip = Thread->OpDispatcher->_EntrypointOffset(GPRSize, Block.Entry - GuestRIP);
+          Thread->OpDispatcher->_ThreadRemoveCodeEntry(BlockRip, BlockRip);
           auto next = Thread->OpDispatcher->CreateNewCodeBlockAfter(current);
           Thread->OpDispatcher->SetFalseJumpTarget(mismatch, next);
           Thread->OpDispatcher->SetCurrentCodeBlock(next);
