@@ -364,24 +364,79 @@ DEF_OP(ValidateCode) {
 
   sub(ARMEmitter::Size::i32Bit, Dst, TMP1, CRC32Reg);
 
-  ARMEmitter::ForwardLabel End;
-  cbz_OrRestart(ARMEmitter::Size::i32Bit, Dst, &End);
+  ARMEmitter::ForwardLabel Match, End;
+  cbz_OrRestart(ARMEmitter::Size::i32Bit, Dst, &Match);
 
   LoadConstant(ARMEmitter::Size::i32Bit, Dst, 1);
+  b_OrRestart(&End);
+  BindOrRestart(&Match);
+  str(ARMEmitter::XReg::zr, STATE, offsetof(FEXCore::Core::CpuStateFrame, LastSMCInvalidateRIP));
   BindOrRestart(&End);
 }
 
 DEF_OP(ThreadRemoveCodeEntry) {
   auto Op = IROp->C<IR::IROp_ThreadRemoveCodeEntry>();
 
-  // Copy before spill: TMP1 (x10) is the spill scratch. x12/x13 are not SRA.
+  // Fast path: this thread already queued this entry. SRA stays live. Still
+  // poke L1+L2 of the ENTRY (not the chunk) so title LoopTop misses and
+  // compiles the rewrite (hbfastq 550ms-stalled with L2 still live). Do not
+  // use x2 (SRA / guest RDX).
+  ARMEmitter::ForwardLabel Slow, SkipL1, SkipL2;
+  mov(ARMEmitter::Size::i64Bit, TMP1, GetReg(Op->EntryToInvalidate));
+  mov(ARMEmitter::Size::i64Bit, TMP2, GetReg(Op->NewRIP));
+  // Title occupancy is chunk 0 of the function (entry == RIP). Fast path
+  // LoopTop then CompileBlock with SRA live (hbfastl1 550ms). In-world the
+  // failing chunk is not the entry.
+  cmp(ARMEmitter::Size::i64Bit, TMP1, TMP2);
+  b_OrRestart(ARMEmitter::Condition::CC_EQ, &Slow);
+  ldr(TMP3, STATE, offsetof(FEXCore::Core::CpuStateFrame, LastSMCInvalidateRIP));
+  cmp(ARMEmitter::Size::i64Bit, TMP1, TMP3);
+  b_OrRestart(ARMEmitter::Condition::CC_NE, &Slow);
+  str(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+
+  ldp<ARMEmitter::IndexType::OFFSET>(TMP3, TMP4, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+  and_(ARMEmitter::Size::i64Bit, TMP4, TMP4, TMP1.R(), ARMEmitter::ShiftType::LSL,
+       FEXCore::ilog2(sizeof(FEXCore::LookupCache::LookupCacheEntry)));
+  add(TMP3, TMP3, TMP4);
+  ldr(TMP4, TMP3, 8);
+  cmp(ARMEmitter::Size::i64Bit, TMP4, TMP1);
+  b_OrRestart(ARMEmitter::Condition::CC_NE, &SkipL1);
+  str(ARMEmitter::XReg::zr, TMP3, 8);
+  BindOrRestart(&SkipL1);
+
+  ldr(TMP3, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.L2Pointer));
+  cbz_OrRestart(ARMEmitter::Size::i64Bit, TMP3, &SkipL2);
+  {
+    const uint64_t VirtualMemorySize = CTX->Config.VirtualMemSize;
+    if (std::popcount(VirtualMemorySize) == 1) {
+      and_(ARMEmitter::Size::i64Bit, TMP4, TMP1, VirtualMemorySize - 1);
+    } else {
+      LoadConstant(ARMEmitter::Size::i64Bit, TMP4, VirtualMemorySize);
+      and_(ARMEmitter::Size::i64Bit, TMP4, TMP1, TMP4);
+    }
+  }
+  lsr(ARMEmitter::Size::i64Bit, TMP2, TMP4, 12);
+  ldr(TMP3, TMP3, TMP2, ARMEmitter::ExtendedType::LSL_64, 3);
+  cbz_OrRestart(ARMEmitter::Size::i64Bit, TMP3, &SkipL2);
+  and_(ARMEmitter::Size::i64Bit, TMP2, TMP4, 0x0FFF);
+  add(TMP3, TMP3, TMP2, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(FEXCore::LookupCache::LookupCacheEntry)));
+  stp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, TMP3, 0);
+  BindOrRestart(&SkipL2);
+
+  ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+  br(TMP1);
+
+  BindOrRestart(&Slow);
+  // Copy before spill: TMP1 (x10) is the spill scratch. x12/x13/x14 are not SRA.
   mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r12, GetReg(Op->EntryToInvalidate));
   mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r13, GetReg(Op->NewRIP));
+  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r14, GetReg(Op->PackedCRC));
 
   SpillStaticRegs(TMP1);
 
-  // x1 is the block to drop. x10 is the failing chunk (may equal x1).
-  str(ARMEmitter::XReg::x12, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+  // GitHub: resume at the failing chunk (NewRIP), invalidate the function entry.
+  // hbgh2 stored the entry in RIP and compiled the rewrite from the top.
+  str(ARMEmitter::XReg::x13, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
   mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, ARMEmitter::Reg::r12);
   mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r10, ARMEmitter::Reg::r13);
   mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, STATE.R());

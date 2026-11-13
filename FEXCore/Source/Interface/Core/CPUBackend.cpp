@@ -353,7 +353,7 @@ namespace CPU {
         return true;
       }
     }
-    return false;
+    return CodeBuffer::AnyLiveContains(Address);
   }
 
 } // namespace CPU

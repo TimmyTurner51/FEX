@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 #include "Interface/Context/Context.h"
+#include "Utils/crc32.h"
+#include <FEXCore/Utils/FH6Stats.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/SHMStats.h>
 #include <FEXCore/Utils/WritePriorityMutex.h>
@@ -12,6 +14,7 @@
 #include <FEXCore/fextl/vector.h>
 #include <FEXCore/fextl/memory_resource.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -20,8 +23,6 @@
 #include <mutex>
 
 namespace FEXCore {
-// Patched callsites from Erase; JIT.cpp runs dc / dsb / ic / dsb / isb once.
-void FlushPendingDelinkICache();
 
 struct LookupCacheBaseLockToken {
 protected:
@@ -35,7 +36,14 @@ private:
   friend struct GuestToHostMap;
   LookupCacheWriteLockToken(FEXCore::Utils::WritePriorityMutex::Mutex& Mutex)
     : Lock {Mutex} {}
-  std::lock_guard<FEXCore::Utils::WritePriorityMutex::Mutex> Lock;
+  LookupCacheWriteLockToken(FEXCore::Utils::WritePriorityMutex::Mutex& Mutex, std::try_to_lock_t Tag)
+    : Lock {Mutex, Tag} {}
+  std::unique_lock<FEXCore::Utils::WritePriorityMutex::Mutex> Lock;
+
+public:
+  bool owns() const {
+    return Lock.owns_lock();
+  }
 };
 
 struct LookupCacheReadLockToken : public LookupCacheBaseLockToken {
@@ -56,8 +64,87 @@ struct GuestToHostMap {
   }
 
   [[nodiscard]]
+  LookupCacheWriteLockToken TryAcquireWriteLock() {
+    return LookupCacheWriteLockToken {Lock, std::try_to_lock};
+  }
+
+  [[nodiscard]]
   LookupCacheReadLockToken AcquireReadLock() {
     return LookupCacheReadLockToken {Lock};
+  }
+
+  bool EraseAddress(uint64_t Address) {
+    auto lk = AcquireWriteLock();
+    return Erase(Address, lk);
+  }
+
+  // Title needs BlockList.erase (hbl1/hbkeep stalled). Delink+ClearICache is
+  // the drive-death (hbasync2/hbmtx). Drop the mapping, stash the original
+  // host, leave incoming jumps aimed at it. CompileBlock reuses the stash
+  // when guest CRC matches instead of compiling the rewrite.
+  bool EraseMappingOnly(uint64_t Address) {
+    auto lk = AcquireWriteLock();
+    return EraseMappingOnlyLocked(Address);
+  }
+
+  // One write lock for a whole batch. The SMC worker drains queued RIPs in runs, and every acquisition
+  // of this lock parks the readers of WritePriorityMutex, so batching is what keeps them out of it.
+  void EraseMappingsOnly(const uint64_t* Addresses, size_t Count) {
+    auto lk = AcquireWriteLock();
+    for (size_t i = 0; i < Count; ++i) {
+      EraseMappingOnlyLocked(Addresses[i]);
+    }
+  }
+
+  // Caller holds the write lock.
+  bool EraseMappingOnlyLocked(uint64_t Address) {
+    auto lower = BlockLinks->lower_bound({Address, nullptr});
+    auto upper = BlockLinks->upper_bound({Address, reinterpret_cast<FEXCore::Context::ExitFunctionLinkData*>(UINTPTR_MAX)});
+    for (auto it = lower; it != upper; it = BlockLinks->erase(it)) {
+      it->second(it->first.HostLink);
+    }
+    auto it = BlockList.find(Address);
+    if (it == BlockList.end()) {
+      return false;
+    }
+    Stash.insert_or_assign(Address, it->second);
+    BlockList.erase(it);
+    FEXCore::FH6Stats::Add(FEXCore::FH6Stats::StashStored);
+    return true;
+  }
+
+  // 1 = restored original host, -1 = still rewritten (caller compiles), 0 = no stash.
+  int TryReuseAfterSMC(uint64_t Address, uint64_t* OutHost, const LookupCacheWriteLockToken&) {
+    auto st = Stash.find(Address);
+    if (st == Stash.end()) {
+      return 0;
+    }
+    const uint32_t Len = st->second.GuestCRCLen;
+    if (!Len) {
+      return 0;
+    }
+    FEXCore::FH6Stats::Add(FEXCore::FH6Stats::StashLookups);
+    const uint32_t CRC = FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(Address), Len);
+    if (CRC != st->second.GuestCRC) {
+      FEXCore::FH6Stats::Add(FEXCore::FH6Stats::StashMiss);
+      return -1;
+    }
+    auto& Restored = BlockList.insert_or_assign(Address, std::move(st->second)).first->second;
+    Stash.erase(st);
+    *OutHost = Restored.HostCode;
+    return 1;
+  }
+
+  // Occupancy the title needs (write lock + delink icache) without dropping
+  // the original host mapping. hbl1 skipped Erase and 550ms-stalled; full
+  // Erase compiles a replacement in-world (house VID 18).
+  void DelinkKeepMapping(uint64_t Address) {
+    auto lk = AcquireWriteLock();
+    auto lower = BlockLinks->lower_bound({Address, nullptr});
+    auto upper = BlockLinks->upper_bound({Address, reinterpret_cast<FEXCore::Context::ExitFunctionLinkData*>(UINTPTR_MAX)});
+    for (auto it = lower; it != upper; it = BlockLinks->erase(it)) {
+      it->second(it->first.HostLink);
+    }
   }
 
   struct BlockLinkTag {
@@ -89,9 +176,12 @@ struct GuestToHostMap {
   struct BlockEntry {
     uint64_t HostCode;
     fextl::vector<uint64_t> CodePages;
+    uint32_t GuestCRC {};
+    uint32_t GuestCRCLen {};
   };
 
   fextl::robin_map<uint64_t, BlockEntry> BlockList;
+  fextl::robin_map<uint64_t, BlockEntry> Stash;
 
   fextl::map<uint64_t, fextl::vector<uint64_t>> CodePages;
 
@@ -104,8 +194,11 @@ struct GuestToHostMap {
     //       If the backend updates the active thread's CodeBuffer, the new associated LookupCache
     //       may already contain the block address. Since is comparatively rare, we'll just leak
     //       one of the two blocks in this case.
+    const uint64_t Room = 0x1000ULL - (Address & 0xFFFULL);
+    const uint32_t Len = static_cast<uint32_t>(Room < 255 ? Room : 255);
+    const uint32_t CRC = FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(Address), Len);
     return BlockList
-      .insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, fextl::vector<uint64_t>(CodePages.begin(), CodePages.end())})
+      .insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, fextl::vector<uint64_t>(CodePages.begin(), CodePages.end()), CRC, Len})
       .first->second;
   }
 
@@ -124,7 +217,6 @@ struct GuestToHostMap {
     for (auto it = lower; it != upper; it = BlockLinks->erase(it)) {
       it->second(it->first.HostLink);
     }
-    FlushPendingDelinkICache();
 
     // Remove from BlockList
     return BlockList.erase(Address) != 0;
@@ -335,9 +427,16 @@ public:
 
     const auto& Entry = Shared->AddBlockMapping(Address, CodePages, HostCode, lk);
 
-    // There is no need to update L1 or L2, they will get updated on first lookup
-    // However, adding to L1 here increases performance
-    CacheBlockMapping(Address, Entry, true, lk);
+    // hbl2add: LoopTop is L2-first (do not flip it L1-first). L1-only here
+    // means the next LoopTop misses L2 and Spill+C++ FindBlock even though
+    // we just compiled. Fill L2 so assembler hits. LoopTop still fills L1
+    // on that hit. Fast, CRC, mutex, TSO, SRA flush unchanged.
+    CacheBlockMapping(Address, Entry, false, lk);
+  }
+
+  int TryReuseAfterSMC(uint64_t Address, uint64_t* OutHost) {
+    auto lk = Shared->AcquireWriteLock();
+    return Shared->TryReuseAfterSMC(Address, OutHost, lk);
   }
 
   // Invalidates L1/L2 for a given guest block
@@ -401,6 +500,32 @@ public:
   void InvalidateCachedBlock(uint64_t Address) {
     auto lk = Shared->AcquireWriteLock();
     InvalidateCache(Address, lk);
+  }
+
+  // Owning thread only. Clears this thread's L1/L2 for Address without the
+  // shared write lock. hbasync died_while_loading after writing L1 from a
+  // worker (LookupCache forbids that except during Erase).
+  void InvalidateLocalCache(uint64_t Address) {
+    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+    if (L1Entry.GuestCode == Address) {
+      L1Entry.GuestCode = 0;
+    }
+    if (!DisableL2Cache()) {
+      uint64_t Addr = Address & (VirtualMemSize - 1);
+      const uint64_t PageOffset = Addr & 0x0FFF;
+      Addr >>= 12;
+      auto* Pointers = reinterpret_cast<uintptr_t*>(PagePointer);
+      const uint64_t LocalPagePointer = Pointers[Addr];
+      if (LocalPagePointer) {
+        auto* BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
+        BlockPointers[PageOffset].GuestCode = 0;
+        BlockPointers[PageOffset].HostCode = 0;
+      }
+    }
+  }
+
+  GuestToHostMap* GetSharedMap() const {
+    return Shared;
   }
 
   // Protection-change callbacks can precede writes, leaving an entry without reverse page

@@ -18,6 +18,46 @@ static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
 // We don't want to move above 128MB atm because that means we will have to encode longer jumps
 static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
 
+namespace {
+  struct LiveCodeRange {
+    std::atomic<uintptr_t> Begin {};
+    std::atomic<uintptr_t> End {};
+  };
+  constexpr size_t MaxLiveCodeBuffers = 256;
+  LiveCodeRange LiveCodeBuffers[MaxLiveCodeBuffers];
+
+  void RegisterLiveCodeBuffer(uintptr_t Begin, uintptr_t End) {
+    for (auto& Range : LiveCodeBuffers) {
+      uintptr_t Expected = 0;
+      if (Range.Begin.compare_exchange_strong(Expected, Begin, std::memory_order_acq_rel)) {
+        Range.End.store(End, std::memory_order_release);
+        return;
+      }
+    }
+    LogMan::Msg::EFmt("Live code buffer table full");
+  }
+
+  void UnregisterLiveCodeBuffer(uintptr_t Begin) {
+    for (auto& Range : LiveCodeBuffers) {
+      if (Range.Begin.load(std::memory_order_acquire) == Begin) {
+        Range.End.store(0, std::memory_order_release);
+        Range.Begin.store(0, std::memory_order_release);
+        return;
+      }
+    }
+  }
+} // namespace
+
+bool CodeBuffer::AnyLiveContains(uintptr_t Address) {
+  for (const auto& Range : LiveCodeBuffers) {
+    const auto Begin = Range.Begin.load(std::memory_order_acquire);
+    if (Begin && Address >= Begin && Address < Range.End.load(std::memory_order_acquire)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed, fextl::shared_ptr<CodeBuffer> Prev)
   : LookupCache(Prev ? Prev->LookupCache : fextl::make_shared<GuestToHostMap>())
   , PrevInChain(std::move(Prev))
@@ -42,9 +82,11 @@ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed, fextl::shared_ptr<CodeBu
 
   CodeBufferEnd = Ptr + UsableSize();
   CodeBufferOffset = Ptr;
+  RegisterLiveCodeBuffer(reinterpret_cast<uintptr_t>(Ptr), reinterpret_cast<uintptr_t>(CodeBufferEnd));
 }
 
 CodeBuffer::~CodeBuffer() {
+  UnregisterLiveCodeBuffer(reinterpret_cast<uintptr_t>(Ptr));
   FEXCore::Allocator::VirtualFree(Ptr, AllocatedSize);
 }
 
@@ -110,7 +152,10 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartLargerCodeBuffer() {
 
   auto NewCodeBufferSize = Latest->TotalAllocationSize();
   NewCodeBufferSize = std::min<size_t>(NewCodeBufferSize * 2, MAX_CODE_SIZE);
-  return AllocateNew(NewCodeBufferSize);
+  // Continue the chain. Without the link this starts a new one, and the buffer being replaced is freed as
+  // soon as the threads migrate: exit links and lookup entries still point into its code, and the thread
+  // that jumps there faults on an unmapped page.
+  return AllocateNew(NewCodeBufferSize, Latest);
 }
 
 fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartMaximalCodeBuffer() {

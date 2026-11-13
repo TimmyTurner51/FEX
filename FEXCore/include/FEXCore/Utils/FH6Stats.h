@@ -26,11 +26,11 @@ enum Counter : uint32_t {
   CompileBlockMiss = 0,  // CompileBlock found nothing in L1/L2/L3
   JITCompiles = 1,       // backend compiles that produced new code
   JITGuestBytes = 2,     // guest bytes covered by those compiles
-  ReviveAttempts = 3,    // misses that had dormant translations for the RIP
+  StashLookups = 3,      // CompileBlock misses that had SMC-stashed translations for the RIP
   CodeBufferOverflows = 4, // full code buffer continued in fresh memory on the same map
-  ReviveHashMiss = 5,    // guest bytes differed
-  ReviveSigMiss = 6,     // page executability/writability differed
-  DormantStored = 7,     // erased translations kept for reuse
+  StashMiss = 5,         // ... where no stashed version matched the current bytes
+  CodePageDupes = 6,     // block entries already listed for their code page
+  StashStored = 7,       // translations stashed by an SMC erase
   SMCMismatch = 8,       // in-block CRC check failed
   ProtNotify = 9,        // NtProtectVirtualMemory notifications
   ProtInvalidate = 10,   // notifications that invalidated
@@ -140,6 +140,12 @@ inline void NoteException(uint64_t Rip, uint32_t Code) {
 }
 
 static constexpr size_t BlockMapSlots = size_t {1} << 21;
+
+// True only under FEX_FH6_STATS=1 (the writer allocates fh6_blockmap). Gates notes on paths that
+// are hot in-world, where the shared counter lines bounce between the SMC-churn threads.
+inline bool Enabled() {
+  return __atomic_load_n(&fh6_blockmap, __ATOMIC_RELAXED) != nullptr;
+}
 
 inline void NoteBlock(uint64_t Rip, uint64_t HostCode) {
   auto* Map = __atomic_load_n(&fh6_blockmap, __ATOMIC_ACQUIRE);

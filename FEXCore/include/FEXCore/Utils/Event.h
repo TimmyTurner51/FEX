@@ -12,6 +12,12 @@ private:
   class Flag final {
   public:
     bool TestAndSet(bool SetValue = true) {
+      // Read first so an already-set flag costs a shared load instead of an exclusive CAS. The fence keeps
+      // the caller's earlier stores ahead of this read, as the CAS would, so no wakeup is skipped.
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (Value.load(std::memory_order_relaxed) == SetValue) {
+        return false;
+      }
       bool Expected = !SetValue;
       return Value.compare_exchange_strong(Expected, SetValue);
     }

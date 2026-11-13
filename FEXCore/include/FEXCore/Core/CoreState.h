@@ -437,11 +437,17 @@ struct CpuStateFrame {
 
   // Pointers that the JIT needs to load to remove relocations
   JITPointers Pointers;
+
+  // Occupancy skip: already queued this entry. Fast path LoopTop without
+  // Spill/C++/Fill but still pokes this thread's L1/L2 of the entry (hbfastq
+  // left L2 live and 550ms-stalled title). Cleared when CRC matches.
+  uint64_t LastSMCInvalidateRIP {};
 };
 static_assert(offsetof(CpuStateFrame, State) == 0, "CPUState must be first member in CpuStateFrame");
 static_assert(offsetof(CpuStateFrame, Pointers) % 8 == 0, "JITPointers need to be aligned to 8 bytes");
 static_assert(offsetof(CpuStateFrame, Pointers) + sizeof(CpuStateFrame::Pointers) <= 32760, "JITPointers maximum pointer needs to be less "
                                                                                             "than architecture maximum 32768");
+static_assert(offsetof(CpuStateFrame, LastSMCInvalidateRIP) <= 32760, "LastSMCInvalidateRIP must fit in ldr offset");
 
 static_assert(std::is_standard_layout<CpuStateFrame>::value, "This needs to be standard layout");
 static_assert(sizeof(CpuStateFrame::SynchronousFaultData) == 8, "This needs to be 8 bytes");

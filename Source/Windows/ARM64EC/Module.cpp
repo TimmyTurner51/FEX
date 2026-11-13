@@ -820,14 +820,69 @@ static void RaiseGuestException(FEXCore::Core::InternalThreadState* Thread, cons
   NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
 }
 
+// Appends Download/fh6_badraise-<pid>.txt when a JIT/dispatcher fault would be raised to the guest with a
+// null RSP: the host registers, which code region the PC is in, and the instructions around it.
+static void NoteBadRaise(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, const ARM64_NT_CONTEXT& Context,
+                         const ARM64_NT_CONTEXT& GuestContext, uint64_t RipBefore) {
+  static std::atomic<uint32_t> Lines {};
+  if (Lines.fetch_add(1, std::memory_order_relaxed) >= 20) {
+    return;
+  }
+  const auto& Config = SignalDelegator->GetConfig();
+  const auto CPUArea = GetCPUArea();
+  const uint64_t Pc = Context.Pc;
+  fextl::string Out = fextl::fmt::format(
+    "badraise tid {} code {:x} p0 {:x} p1 {:x} pc {:x} sp {:x} lr {:x} fp {:x} x17 {:x} x23 {:x} x24 {:x} x28 {:x} frame {:x} "
+    "disp {:d} [{:x},{:x}) jit {:d} rip_before {:x} rip_host {:x} guest pc {:x} sp {:x} emustack [{:x},{:x}] sra_rsp x{}\n",
+    GetCurrentThreadId(), static_cast<uint32_t>(Rec.ExceptionCode), Rec.ExceptionInformation[0], Rec.ExceptionInformation[1], Pc,
+    Context.Sp, Context.Lr, Context.Fp, Context.X17, Context.X23, Context.X24, Context.X28,
+    reinterpret_cast<uint64_t>(CPUArea.StateFrame()), IsDispatcherAddress(Pc), Config.DispatcherBegin, Config.DispatcherEnd,
+    CTX->IsAddressInCodeBuffer(Thread, Pc), RipBefore, CTX->RestoreRIPFromHostPC(Thread, Pc), GuestContext.Pc, GuestContext.Sp,
+    CPUArea.EmulatorStackLimit(), CPUArea.EmulatorStackBase(), static_cast<uint32_t>(Config.SRAGPRMapping[FEXCore::X86State::REG_RSP]));
+  if (CTX->IsAddressInCodeBuffer(Thread, Pc) || IsDispatcherAddress(Pc)) {
+    Out += fextl::fmt::format("  code@{:x}", Pc - 40);
+    for (uint64_t A = Pc - 40; A < Pc + 24; A += 4) {
+      Out += fextl::fmt::format(" {:08x}", *reinterpret_cast<const uint32_t*>(A));
+    }
+    Out += "\n";
+  }
+  FH6StatsWriter::PidPath Path(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_badraise-");
+  Path.Write(Out.data(), Out.size(), true);
+}
+
+// Appends to the same file when a JIT fault is handed to the guest handlers as-is: they see a host JIT
+// context in x64 layout, and continuing it resumes the JIT with x23/x24/x28 zeroed.
+static void NoteJitPassThrough(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, const ARM64_NT_CONTEXT& Context,
+                               uint64_t HandlerFrame, const char* Tag) {
+  static std::atomic<uint32_t> Lines {};
+  if (Lines.fetch_add(1, std::memory_order_relaxed) >= 20) {
+    return;
+  }
+  const auto CPUArea = GetCPUArea();
+  fextl::string Out = fextl::fmt::format(
+    "{} tid {} code {:x} p0 {:x} p1 {:x} pc {:x} sp {:x} lr {:x} x17 {:x} x23 {:x} x28 {:x} handler_frame {:x} "
+    "emustack [{:x},{:x}] rip {:x} rip_host {:x} insim {:d} incb {:d}\n",
+    Tag, GetCurrentThreadId(), static_cast<uint32_t>(Rec.ExceptionCode), Rec.ExceptionInformation[0], Rec.ExceptionInformation[1], Context.Pc,
+    Context.Sp, Context.Lr, Context.X17, Context.X23, Context.X28, HandlerFrame, CPUArea.EmulatorStackLimit(),
+    CPUArea.EmulatorStackBase(), Thread->CurrentFrame->State.rip,
+    CTX->IsAddressInCodeBuffer(Thread, Context.Pc) ? CTX->RestoreRIPFromHostPC(Thread, Context.Pc) : 0,
+    CPUArea.Area->InSimulation, CPUArea.Area->InSyscallCallback);
+  FH6StatsWriter::PidPath Path(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_badraise-");
+  Path.Write(Out.data(), Out.size(), true);
+}
+
 static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& Context) {
   auto* Thread = GetCPUArea().ThreadState();
+  const uint64_t RipBefore = Thread->CurrentFrame->State.rip;
 
   LogMan::Msg::DFmt("Reconstructing context");
   if (!IsDispatcherAddress(Context.Pc)) {
     ReconstructThreadState(Thread, Context);
   }
   ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
+  if (GuestContext.Sp < 0x10000) {
+    NoteBadRaise(Thread, Rec, Context, GuestContext, RipBefore);
+  }
   LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, GuestContext.Pc);
   RaiseGuestException(Thread, Rec, GuestContext);
 }
@@ -1003,7 +1058,36 @@ NTSTATUS ProcessInit() {
   return STATUS_SUCCESS;
 }
 
-void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
+// Appends Download/fh6_exit-<pid>.txt on NtTerminateProcess: status, caller tid, and every stack qword
+// that points into executable image pages (guest x64 and native frames share this stack on ARM64EC).
+// No file after a death means the process was killed from outside (SIGKILL), not exited.
+void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
+  if (After) {
+    return;
+  }
+  FH6StatsWriter::PidPath Path(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_exit-");
+  const uint64_t Sp = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
+  const uint64_t StackBase = reinterpret_cast<uint64_t>(reinterpret_cast<NT_TIB*>(NtCurrentTeb())->StackBase);
+  fextl::string Out = fextl::fmt::format("term handle {:x} status {:x} tid {} sp {:x} stackbase {:x}\n", reinterpret_cast<uint64_t>(Handle),
+                                         static_cast<uint32_t>(Status), GetCurrentThreadId(), Sp, StackBase);
+  constexpr DWORD ExecMask = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+  size_t Hits = 0;
+  for (uint64_t A = Sp; A + 8 <= StackBase && A < Sp + 0x40000 && Hits < 48; A += 8) {
+    const uint64_t V = *reinterpret_cast<const uint64_t*>(A);
+    if (V < 0x10000) {
+      continue;
+    }
+    MEMORY_BASIC_INFORMATION Info;
+    if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(V), MemoryBasicInformation, &Info, sizeof(Info), nullptr) ||
+        Info.Type != MEM_IMAGE || !(Info.Protect & ExecMask)) {
+      continue;
+    }
+    const uint64_t Base = reinterpret_cast<uint64_t>(Info.AllocationBase);
+    Out += fextl::fmt::format("  sp+{:x} {:x} mod {:x}+{:x}\n", A - Sp, V, Base, V - Base);
+    ++Hits;
+  }
+  Path.Write(Out.data(), Out.size(), true);
+}
 
 class ScopedCallbackDisable {
 private:
@@ -1077,6 +1161,9 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
 
   if (!IsJIT && !IsDispatcherAddress(NativeContext->Pc)) {
     LogMan::Msg::DFmt("Passing through exception");
+    if (NativeContext->X28 == reinterpret_cast<uint64_t>(Thread->CurrentFrame)) {
+      Exception::NoteJitPassThrough(Thread, *Exception, *NativeContext, reinterpret_cast<uint64_t>(__builtin_frame_address(0)), "notjit");
+    }
     return false;
   }
 
@@ -1097,6 +1184,7 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
     return true;
   } else {
     LogMan::Msg::EFmt("Unexpected exception in JIT code on guest stack");
+    Exception::NoteJitPassThrough(Thread, *Exception, *NativeContext, reinterpret_cast<uint64_t>(__builtin_frame_address(0)), "passjit");
     return false;
   }
 }

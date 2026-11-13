@@ -201,7 +201,7 @@
         "DestSize": "OpSize::i64Bit"
       },
 
-      "ThreadRemoveCodeEntry GPR:$EntryToInvalidate, GPR:$NewRIP": {
+      "ThreadRemoveCodeEntry GPR:$EntryToInvalidate, GPR:$NewRIP, GPR:$PackedCRC": {
         "HasSideEffects": true
       },
 

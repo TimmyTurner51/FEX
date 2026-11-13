@@ -9,6 +9,11 @@ $end_info$
 */
 
 #include <cstdint>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <mutex>
+#include <thread>
 #ifdef ZYDIS_DISASSEMBLER
 #include <Zydis/Zydis.h>
 #endif
@@ -84,6 +89,100 @@ namespace FEXCore::Context {
 namespace {
 // Read once here: getenv takes the CRT environment lock, which must not be taken while compiling.
 int PoolCloneModeValue = 1;
+
+// GitHub InvalidateBlock on the presenting thread is the 1 Hz hitch (write lock).
+// Delink died on drive (hbasync2/hbmtx). LoopTop-on-mismatch stalled title
+// (hbreuse). hbmap mapping-only held. Reuse the stashed original host when
+// guest CRC matches; otherwise compile (title occupancy).
+Event SMCInvalidateEvent;
+std::once_flag SMCInvalidateOnce;
+fextl::unique_ptr<FEXCore::Threads::Thread> SMCInvalidateWorkerThread;
+
+// Queued SMC erases. The worker used to take the map's write lock once per event, and every one of
+// those parks the WritePriorityMutex readers, which is the bulk of the time spent in lock_shared.
+// Entries are drained in runs and erased under a single lock acquisition; the order of the erases is
+// the order they were queued, as before. A full ring falls back to erasing at the producer.
+struct SMCPendingEntry {
+  FEXCore::GuestToHostMap* Map;
+  uint64_t RIP;
+};
+constexpr size_t SMCPendingCap = 4096;
+SMCPendingEntry SMCPendingEntries[SMCPendingCap];
+std::atomic<size_t> SMCPendingCount {0};
+std::mutex SMCPendingMutex;
+
+void* SMCInvalidateWorker(void*) {
+  constexpr size_t BatchMax = 64;
+  SMCPendingEntry Batch[BatchMax];
+  uint64_t RIPs[BatchMax];
+
+  for (;;) {
+    SMCInvalidateEvent.Wait();
+
+    size_t Count;
+    size_t N;
+    {
+      std::lock_guard<std::mutex> lk(SMCPendingMutex);
+      Count = SMCPendingCount.load(std::memory_order_relaxed);
+      N = Count < BatchMax ? Count : BatchMax;
+      if (N) {
+        memcpy(Batch, SMCPendingEntries, N * sizeof(SMCPendingEntry));
+        memmove(SMCPendingEntries, SMCPendingEntries + N, (Count - N) * sizeof(SMCPendingEntry));
+        SMCPendingCount.store(Count - N, std::memory_order_release);
+      }
+    }
+    if (!N) {
+      continue;
+    }
+
+    for (size_t i = 0; i < N;) {
+      size_t j = i;
+      while (j < N && Batch[j].Map == Batch[i].Map) {
+        RIPs[j - i] = Batch[j].RIP;
+        ++j;
+      }
+      Batch[i].Map->EraseMappingsOnly(RIPs, j - i);
+      i = j;
+    }
+
+    if (SMCPendingCount.load(std::memory_order_acquire) != 0) {
+      // More is queued. The map lock favours writers, so taking it again right away would starve every
+      // reader of it (that is the 1 FPS start-up stall). Leave the readers a window first.
+      std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
+  }
+}
+
+void QueueSMCInvalidate(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) {
+  Thread->CurrentFrame->LastSMCInvalidateRIP = GuestRIP;
+  Thread->LookupCache->InvalidateLocalCache(GuestRIP);
+  auto* Map = Thread->LookupCache->GetSharedMap();
+  std::call_once(SMCInvalidateOnce, [] {
+    SMCInvalidateWorkerThread = FEXCore::Threads::Thread::Create(SMCInvalidateWorker, nullptr, {}, "FEX_SMCInv");
+  });
+  if (!SMCInvalidateWorkerThread || !Map) {
+    if (Map) {
+      Map->EraseMappingOnly(GuestRIP);
+    }
+    return;
+  }
+
+  bool Queued = false;
+  {
+    std::lock_guard<std::mutex> lk(SMCPendingMutex);
+    const size_t Count = SMCPendingCount.load(std::memory_order_relaxed);
+    if (Count < SMCPendingCap) {
+      SMCPendingEntries[Count] = {Map, GuestRIP};
+      SMCPendingCount.store(Count + 1, std::memory_order_release);
+      Queued = true;
+    }
+  }
+  if (!Queued) {
+    Map->EraseMappingOnly(GuestRIP);
+    return;
+  }
+  SMCInvalidateEvent.NotifyOne();
+}
 } // namespace
 
 ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
@@ -922,16 +1021,11 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->SetTrueJumpTarget(mismatch, fail);
           Thread->OpDispatcher->SetCurrentCodeBlock(fail);
           Thread->OpDispatcher->StartNewBlock();
-          // Drop the block whose bytes changed. Offset 0 is the function entry, so the block
-          // that failed stayed cached, failed again on the next entry, and the function was
-          // recompiled on every pass.
-          auto BlockRip = Thread->OpDispatcher->_EntrypointOffset(GPRSize, Block.Entry - GuestRIP);
-          // Entry stays the block (x1 / C++ GuestRIP). NewRIP carries the failing
-          // chunk so the dispatcher can wait on it in x10. Skip-C++ after that
-          // wait died even on original halfword (5ebd0715) and full CRC (ccbf7f81).
-          // Full-CRC wait then C++ died_after_drive (3618066c).
-          // Prologue 2-byte chunks died_after_drive with in-world beat (57e50026).
-          Thread->OpDispatcher->_ThreadRemoveCodeEntry(BlockRip, addr);
+          // GitHub: invalidate the function entry (offset 0), not the failing
+          // block. Dispatcher waits out UD2 on the chunk then always C++ this
+          // entry. Skip-C++ after that wait (hbge) died_after_drive.
+          auto EntryRip = Thread->OpDispatcher->_EntrypointOffset(GPRSize, 0);
+          Thread->OpDispatcher->_ThreadRemoveCodeEntry(EntryRip, addr, Thread->OpDispatcher->Constant(0));
           auto next = Thread->OpDispatcher->CreateNewCodeBlockAfter(current);
           Thread->OpDispatcher->SetFalseJumpTarget(mismatch, next);
           Thread->OpDispatcher->SetCurrentCodeBlock(next);
@@ -1009,7 +1103,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           auto EntryToInvalidate = Thread->OpDispatcher->_EntrypointOffset(GPRSize, 0);
           auto NewRIP = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
           // Invalidate and exit the function
-          Thread->OpDispatcher->_ThreadRemoveCodeEntry(EntryToInvalidate, NewRIP);
+          Thread->OpDispatcher->_ThreadRemoveCodeEntry(EntryToInvalidate, NewRIP, Thread->OpDispatcher->Constant(0));
 
           auto NextOpBlock = Thread->OpDispatcher->CreateNewCodeBlockAfter(CurrentBlock);
 
@@ -1218,6 +1312,12 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   // The backends only check L1 and L2, not L3
   if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
     return HostCode;
+  }
+  {
+    uint64_t Reused = 0;
+    if (Thread->LookupCache->TryReuseAfterSMC(GuestRIP, &Reused) == 1) {
+      return Reused;
+    }
   }
   FEXCore::FH6Stats::Add(FEXCore::FH6Stats::CompileBlockMiss);
 
@@ -1565,7 +1665,7 @@ void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Fra
     // Every block compiled from writable code validates its own bytes on entry, so a thread that
     // reaches a stale copy through its own cache, an older buffer's links, or a racing link detects
     // the mismatch itself and erases it from the map it looks up in. Drop only this thread's block.
-    Thread->LookupCache->InvalidateBlock(GuestRIP);
+    QueueSMCInvalidate(Thread, GuestRIP);
     return;
   }
 

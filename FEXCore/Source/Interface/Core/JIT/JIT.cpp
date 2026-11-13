@@ -114,52 +114,6 @@ static void PrintVectorValue(uint64_t Value, uint64_t ValueUpper) {
 }
 } // namespace
 
-namespace {
-void* PendingDelinkICache[4096];
-size_t PendingDelinkCount {};
-}
-
-namespace FEXCore {
-void FlushPendingDelinkICache() {
-  if (PendingDelinkCount == 0) {
-    return;
-  }
-#if defined(ARCHITECTURE_arm64)
-  // dc/ic operate on the containing line. Duplicate callsites in the same
-  // 64-byte line were the C++ hitch after WaitChunk. Keep the flush under the
-  // lock (4680774b moved it after unlock and died). Do not use
-  // FlushInstructionCache (hbbulk3/4 died).
-  for (size_t i = 0; i < PendingDelinkCount; ++i) {
-    PendingDelinkICache[i] =
-      reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(PendingDelinkICache[i]) & ~uintptr_t(63));
-  }
-  std::sort(PendingDelinkICache, PendingDelinkICache + PendingDelinkCount);
-  size_t Unique = 1;
-  for (size_t i = 1; i < PendingDelinkCount; ++i) {
-    if (PendingDelinkICache[i] != PendingDelinkICache[Unique - 1]) {
-      PendingDelinkICache[Unique++] = PendingDelinkICache[i];
-    }
-  }
-  PendingDelinkCount = Unique;
-  for (size_t i = 0; i < PendingDelinkCount; ++i) {
-    auto Addr = reinterpret_cast<uintptr_t>(PendingDelinkICache[i]);
-    __asm__ volatile("dc cvau, %0" : : "r"(Addr) : "memory");
-  }
-  __asm__ volatile("dsb ish" : : : "memory");
-  for (size_t i = 0; i < PendingDelinkCount; ++i) {
-    auto Addr = reinterpret_cast<uintptr_t>(PendingDelinkICache[i]);
-    __asm__ volatile("ic ivau, %0" : : "r"(Addr) : "memory");
-  }
-  __asm__ volatile("dsb ish\n\tisb" : : : "memory");
-#else
-  for (size_t i = 0; i < PendingDelinkCount; ++i) {
-    ARMEmitter::Emitter::ClearICache(PendingDelinkICache[i], 4);
-  }
-#endif
-  PendingDelinkCount = 0;
-}
-} // namespace FEXCore
-
 namespace FEXCore::CPU {
 
 void Arm64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
@@ -580,12 +534,11 @@ void Arm64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
   }
 }
 
-static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, bool Call) {
+[[maybe_unused]] static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, bool Call) {
   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
   uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
   auto BranchOffset = JumpThunkStartAddress / 4 - CallerAddress / 4;
 
-  // Replace the patched callsite with a branch to the jump thunk.
   uint32_t BranchInst = 0;
   ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
   if (Call) {
@@ -595,26 +548,19 @@ static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, 
   }
 
   std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(CallerAddress)).store(BranchInst, std::memory_order::relaxed);
-  if (PendingDelinkCount == 4096) {
-    FEXCore::FlushPendingDelinkICache();
-  }
-  PendingDelinkICache[PendingDelinkCount++] = reinterpret_cast<void*>(CallerAddress);
+  ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(CallerAddress), 4);
 }
 
 static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record) {
-  uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
-  uint32_t BranchInst = 0;
-  ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
-  // Restore branch +2 instructions to jump to the linker block
-  BranchEmit.b(0x2);
-
-  std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(JumpThunkStartAddress)).store(BranchInst, std::memory_order::relaxed);
-  if (PendingDelinkCount == 4096) {
-    FEXCore::FlushPendingDelinkICache();
-  }
-  PendingDelinkICache[PendingDelinkCount++] = reinterpret_cast<void*>(JumpThunkStartAddress);
-
-  // No need to reset HostCode here as the exit linker pointer is stored separately, and if the block is relinked it will be updated.
+  // Linked thunk is ldr TMP1, HostCode; br TMP1. Point HostCode at the
+  // thunk's own linker stub (insn +8) so incoming jumps leave without
+  // rewriting executable bytes. hbasync2 / hbrxdir / hbthunkb died on
+  // ClearICache of live JIT (caller or thunk-as-b).
+  const uintptr_t LinkerInsn = reinterpret_cast<uintptr_t>(Record) - 0x10 + 8;
+  std::atomic_ref<uint64_t>(Record->HostCode).store(LinkerInsn, std::memory_order::seq_cst);
+#if defined(ARCHITECTURE_arm64) || defined(ARCHITECTURE_arm64ec)
+  asm volatile("dc cvau, %0; dsb ish" : : "r"(&Record->HostCode) : "memory");
+#endif
 }
 
 uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record) {
@@ -644,14 +590,7 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     }
   }
 
-  // See ExitFunction in BranchOps.cpp for an assembly level view of the handled cases.
   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
-  uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
-  auto BranchOffset = HostCode / 4 - CallerAddress / 4;
-
-  uint32_t ExpectedKnownCallMarkerInst = 0;
-  ARMEmitter::Emitter ExpectedKnownCallMarkerEmit(reinterpret_cast<uint8_t*>(&ExpectedKnownCallMarkerInst), 4);
-  ExpectedKnownCallMarkerEmit.adr(TMP1, 0xC);
 
   // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking
   auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);
@@ -659,43 +598,25 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
   // Lock here is necessary to prevent simultaneous linking and delinking
   auto lk = Thread->LookupCache->AcquireWriteLock();
 
-  // For non-calls, this would extend into the block's code, however that's fine as an out-of-range adr would never
-  // be generated avoiding any false positives.
-  uintptr_t KnownCallMarkerAddr = CallerAddress - 0x8;
-  uint32_t KnownCallMarkerInst = *reinterpret_cast<uint32_t*>(KnownCallMarkerAddr);
-  if (ARMEmitter::Emitter::IsInt26(BranchOffset)) {
-    // Directly patch the callsite with the appropriate branch instruction.
-    uint32_t BranchInst = 0;
-    ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
-
-    if (KnownCallMarkerInst == ExpectedKnownCallMarkerInst) {
-      BranchEmit.bl(BranchOffset);
-      Thread->LookupCache->AddBlockLink(
-        GuestRip, Record, [](FEXCore::Context::ExitFunctionLinkData* Record) { DirectBlockDelinker(Record, true); }, lk);
-    } else {
-      BranchEmit.b(BranchOffset);
-      Thread->LookupCache->AddBlockLink(
-        GuestRip, Record, [](FEXCore::Context::ExitFunctionLinkData* Record) { DirectBlockDelinker(Record, false); }, lk);
-    }
-
-    std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(CallerAddress)).store(BranchInst, std::memory_order::relaxed);
-    ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(CallerAddress), 4);
-  } else {
-    // This case is common between calls and jumps as the thunk callsite can be left untouched.
-    std::atomic_ref<uint64_t>(Record->HostCode).store(HostCode, std::memory_order::seq_cst);
-#ifdef ARCHITECTURE_arm64
-    // Make memory write visible to other threads reading the same location
-    asm volatile("dc cvau, %0; dsb ish" : : "r"(Record->HostCode) :);
+  // Always link through HostCode (data). Direct b/bl into live JIT is what
+  // ClearICache-delink killed on drive (hbasync2 / hbrxdir / hbthunkb). First
+  // conversion of the thunk from `b +8` to `ldr` still needs one icache flush;
+  // after that delink/relink is a pointer store.
+  std::atomic_ref<uint64_t>(Record->HostCode).store(HostCode, std::memory_order::seq_cst);
+#if defined(ARCHITECTURE_arm64) || defined(ARCHITECTURE_arm64ec)
+  asm volatile("dc cvau, %0; dsb ish" : : "r"(&Record->HostCode) : "memory");
 #endif
 
-    uint32_t LdrInst = 0;
-    ARMEmitter::Emitter LdrEmit(reinterpret_cast<uint8_t*>(&LdrInst), 4);
-    LdrEmit.ldr(TMP1, reinterpret_cast<uint64_t>(&Record->HostCode) - JumpThunkStartAddress);
-    std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(JumpThunkStartAddress)).store(LdrInst, std::memory_order::relaxed);
+  uint32_t LdrInst = 0;
+  ARMEmitter::Emitter LdrEmit(reinterpret_cast<uint8_t*>(&LdrInst), 4);
+  LdrEmit.ldr(TMP1, reinterpret_cast<uint64_t>(&Record->HostCode) - JumpThunkStartAddress);
+  std::atomic_ref<uint32_t> ThunkWord(*reinterpret_cast<uint32_t*>(JumpThunkStartAddress));
+  if (ThunkWord.load(std::memory_order::relaxed) != LdrInst) {
+    ThunkWord.store(LdrInst, std::memory_order::relaxed);
     ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
-
-    Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);
   }
+
+  Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);
 
   return HostCode;
 }

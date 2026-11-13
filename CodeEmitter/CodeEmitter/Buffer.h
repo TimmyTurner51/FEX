@@ -66,6 +66,23 @@ public:
     __builtin___clear_cache(static_cast<char*>(Begin), static_cast<char*>(Begin) + Length);
   }
 
+  // Publish one patched instruction without a barrier. Pair with FinishICacheInvalidate.
+  static void InvalidateICacheLine(void* Begin) {
+#if defined(ARCHITECTURE_arm64)
+    auto Addr = reinterpret_cast<uintptr_t>(Begin);
+    __asm__ volatile("dc cvau, %0" : : "r"(Addr) : "memory");
+    __asm__ volatile("ic ivau, %0" : : "r"(Addr) : "memory");
+#else
+    ClearICache(Begin, 4);
+#endif
+  }
+
+  static void FinishICacheInvalidate() {
+#if defined(ARCHITECTURE_arm64)
+    __asm__ volatile("dsb ish\n\tisb" : : : "memory");
+#endif
+  }
+
   size_t GetCursorOffset() const {
     return static_cast<size_t>(CurrentOffset - BufferBase);
   }

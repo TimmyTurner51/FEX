@@ -102,6 +102,10 @@ struct CodeBuffer {
     return Ptr;
   }
 
+  // True if Address is in any code buffer still allocated, whichever chain it belongs to. A thread that
+  // moved to a newer chain can still be running linked blocks or call-ret returns in an older one. Signal-safe.
+  static bool AnyLiveContains(uintptr_t Address);
+
   // True if Address is code in this buffer or an older one of its chain. Signal-safe.
   bool ChainContains(uintptr_t Address) const {
     for (const CodeBuffer* Buffer = this; Buffer; Buffer = Buffer->PrevInChain.get()) {

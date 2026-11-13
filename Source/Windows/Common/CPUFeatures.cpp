@@ -77,6 +77,13 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
 
   FEX::FetchHostFeatures(Features, HostFeatures, !IsWine, CTR, MIDR);
 
+  // hbnoafp: hostprof put ~25% of samples on the two serializing FPCR
+  // writes per EC transition (EnterEC sets NEP/AH, ExitFunctionEC clears
+  // them). Without AFP the JIT never sets them, so neither write is needed.
+  // RPRES only gives 12-bit estimates with AH set, so it goes off too.
+  HostFeatures.SupportsAFP = false;
+  HostFeatures.SupportsRPRES = false;
+
   // Force-disable SVE until wine/windows gain support for SVE context save/restore
   HostFeatures.SupportsSVE128 = false;
   HostFeatures.SupportsSVE256 = false;

@@ -56,9 +56,13 @@ BeginSimulation:
 .global ExitFunctionEC
 ExitFunctionEC:
   // Clear any the AFP NEP and AH bits in FPCR as native code won't expect their behaviour.
+  // Skip the serializing write when they are already clear. x16 is free here and avoids clobbering NZCV.
   mrs x17, fpcr
+  and x16, x17, #6
+  cbz x16, 9f
   and x17, x17, #~6 // NEP + AH
   msr fpcr, x17
+9:
   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
   strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
   ldr x17, [x17, #0x20] // ChpeV2CpuAreaInfo->SuspendDoorbell
