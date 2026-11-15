@@ -172,8 +172,20 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
                           ProtInterval.End, AlignedSize >> 20, Prot);
         return false;
       }
-      LogMan::Msg::EFmt("[iOS-xrem] via=protect tracker={} {:#x}-{:#x}", static_cast<void*>(this),
-                        ProtInterval.Offset, ProtInterval.End);
+      /* DroidDeck: one mapping, mprotect in place, SMCChecks=full. iOS has a PE
+       * view plus a pool copy; a host mprotect without EXEC is reported here and
+       * used to drop the SMC interval the guest just armed with
+       * VirtualProtect(PAGE_EXECUTE_READWRITE). FH6 17:20: Add SMC on ntdll .data
+       * 71F3372000-71F3374000 then via=protect of the same 8 KB (ml1267's skipped
+       * second restore did not stop it), then empty VEH at the still-encrypted
+       * EA prologue. Keep a small RWX interval the guest made executable. */
+      if (AlignedSize <= 0x10000 && RWXIntervals.Intersect(ProtInterval)) {
+        LogMan::Msg::EFmt("[iOS-xrem] SUPPRESSED SMC keep {:#x}-{:#x} notify_prot={:#x} (guest RWX still armed)",
+                          ProtInterval.Offset, ProtInterval.End, Prot);
+        return false;
+      }
+      LogMan::Msg::EFmt("[iOS-xrem] via=protect tracker={} {:#x}-{:#x} prot={:#x}", static_cast<void*>(this),
+                        ProtInterval.Offset, ProtInterval.End, Prot);
       XIntervals.Remove(ProtInterval);
       RWXIntervals.Remove(ProtInterval);
       if (DEPDisabled) {
