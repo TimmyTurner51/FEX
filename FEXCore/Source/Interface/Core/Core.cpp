@@ -93,6 +93,10 @@ int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out);
 #include <utility>
 #include <xxhash.h>
 
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+extern "C" uint64_t IosJitSMCFetch(uint64_t Addr);
+#endif
+
 /* MADEIRA: gated like the HOT RIP telemetry in CompileBlock, the only user of these globals. */
 #if defined(FEX_IOS_HOST) || !defined(_WIN32)
 /* iOS-Madeira HOTRIP telemetry — plain globals (no constructors/guard vars).
@@ -1055,10 +1059,22 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           // while a thread was translating it) would be checked against its new bytes but run as the
           // old instruction, and the self-loop never saw the change. The address handed to
           // _ValidateCode below stays guest; DEF_OP(ValidateCode) applies the window itself.
-          auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
           std::array<uint8_t, 0x10> CodeOriginal;
           memcpy(CodeOriginal.data(), DecodedInfo->InstBytes, DecodedInfo->InstSize);
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+          /* Validate against the same bytes the decoder read (pool alias on a
+           * guest RWX PE page). Loading the PE VA would always disagree. */
+          const uint64_t FetchAddr = IosJitSMCFetch(InstAddress);
+          auto CodeChanged = (FetchAddr != InstAddress)
+                               ? Thread->OpDispatcher->_ValidateCode(CodeOriginal, Thread->OpDispatcher->_Constant(FetchAddr),
+                                                                    DecodedInfo->InstSize)
+                               : Thread->OpDispatcher->_ValidateCode(
+                                   CodeOriginal, Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP),
+                                   DecodedInfo->InstSize);
+#else
+          auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
           auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CodeOriginal, InstAddressReg, DecodedInfo->InstSize);
+#endif
 
           auto InvalidateCodeCond = Thread->OpDispatcher->CondJump(CodeChanged);
 
@@ -1351,6 +1367,7 @@ extern "C" uint64_t IosCbEntryLog[8];
 /* iOS-Madeira ml315 (#52): alias-table walk from IosJitAlias.cpp (same DLL link). Maps a
  * module-pool-copy address back to its PE VA; returns the input unchanged on no match. */
 extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
+extern "C" uint64_t IosJitSMCFetch(uint64_t Addr);
 /* iOS-Madeira ml316: ExitToX64's FFS-bypass counters, defined in Module.cpp and written by
  * the bypass asm in Module.S. Reported below the same way as [cb-entry]. */
 extern "C" uint64_t IosFfsBypassLog[20];
@@ -1362,6 +1379,9 @@ extern "C" uint64_t IosFfsBypassLog[20];
 extern "C" uint64_t IosCbEntryLog[8];
 static uint64_t IosFfsBypassLog[20] {};
 static inline uint64_t IosJitReverseTranslate(uint64_t Addr) {
+  return Addr;
+}
+static inline uint64_t IosJitSMCFetch(uint64_t Addr) {
   return Addr;
 }
 #endif
@@ -1559,6 +1579,28 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
+  /* [ffs-route] names the branch ExitToX64 took on the most recent call, and the
+   * argument it was handed. Reported on change so a fault can be attributed to a
+   * single call: 0x44 entry, 0x41 ios_ffs_check (not a thunk shape), 0x42
+   * ios_ec_entry_miss (bitmap said not-EC), 0x43 ios_thunk_slot (thunk shape
+   * recognised). These live in this array rather than in cpu_area because
+   * cpu_area[0x48] is EmulatorData[3], DispatcherLoopTopEnterECFillSRA -- a live
+   * dispatcher pointer that BeginSimulation branches through, so writing it made
+   * the next BeginSimulation jump into x86-64 bytes. */
+  {
+    static uint64_t RouteLast = 0;
+    static uint32_t RouteReports = 0;
+    const uint64_t Route = (IosFfsBypassLog[19] << 32) ^ IosFfsBypassLog[18];
+    if (Route != RouteLast && RouteReports < 12) {
+      RouteLast = Route;
+      RouteReports++;
+      LogMan::Msg::EFmt("[ffs-route] last route={:#x} (0x44 entry, 0x41 ios_ffs_check, "
+                        "0x42 ec_entry_miss, 0x43 thunk_slot) x9={:#x}",
+                        IosFfsBypassLog[19], IosFfsBypassLog[18]);
+    }
+  }
+
+
   /* [ffs-follow] proves the 0005 chain actually ran: how many x64 fast-forward
    * prologues ExitToX64 unwrapped, and the last native target reached. A run
    * that reaches a hybrid export now shows a non-zero count here, so a repeat of
@@ -1654,6 +1696,25 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       return Frame->Pointers.DispatcherLoopTop;
     }
   }
+#ifdef ARCHITECTURE_arm64ec
+  {
+    const uint64_t Fetch = IosJitSMCFetch(GuestRIP);
+    if (Fetch != GuestRIP) {
+      static std::atomic<uint32_t> SmcFetchN {0};
+      const uint32_t N = SmcFetchN.fetch_add(1, std::memory_order_relaxed);
+      if (N < 24) {
+        uint8_t PeB[8] {}, PoolB[8] {};
+        memcpy(PeB, reinterpret_cast<const void*>(GuestRIP), sizeof(PeB));
+        memcpy(PoolB, reinterpret_cast<const void*>(Fetch), sizeof(PoolB));
+        LogMan::Msg::EFmt("[ios-smc-fetch] compile #{} pe={:#x} pool={:#x} "
+                          "pe_bytes={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} "
+                          "pool_bytes={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                          N + 1, GuestRIP, Fetch, PeB[0], PeB[1], PeB[2], PeB[3], PeB[4], PeB[5], PeB[6], PeB[7],
+                          PoolB[0], PoolB[1], PoolB[2], PoolB[3], PoolB[4], PoolB[5], PoolB[6], PoolB[7]);
+      }
+    }
+  }
+#endif
 #endif
 
   /* iOS-Madeira ml197: NAME THE PRODUCER OF A HOST-ADDRESS "GUEST RIP".

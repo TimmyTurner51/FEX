@@ -496,6 +496,34 @@ uint64_t IosJitReverseTranslate(uint64_t Addr) {
   return Addr;
 }
 
+/* FH6 17:34: iOS never grants W+X on a file-backed PE page (ml999). Guest
+ * VirtualProtect(ntdll .data, PAGE_EXECUTE_READWRITE) therefore lands as host
+ * RX, x64 stores fault, and Wine's Mach emulator writes the pool copy. FEX
+ * compiles the PE VA, so it decoded the still-RX file bytes instead of the
+ * gadgets. DroidDeck has one mapping: the stored bytes are the fetched bytes.
+ * When the PE page is a guest RWX/SMC interval, fetch the pool alias. */
+static uint32_t (*g_SMCWritable)(uint64_t Addr) = nullptr;
+
+void IosJitSetSMCQuery(uint32_t (*fn)(uint64_t Addr)) {
+  g_SMCWritable = fn;
+}
+
+uint64_t IosJitSMCFetch(uint64_t Addr) {
+  uint64_t Pool = IosJitTranslate(Addr);
+  if (Pool == Addr || !g_SMCWritable) {
+    return Addr;
+  }
+  if (!g_SMCWritable(Addr)) {
+    return Addr;
+  }
+  static std::atomic<uint32_t> Logged {0};
+  const uint32_t N = Logged.fetch_add(1, std::memory_order_relaxed);
+  if (N < 16) {
+    LogMan::Msg::EFmt("[ios-smc-fetch] #{} pe={:#x} -> pool={:#x} (guest RWX; iOS host is not W+X)", N + 1, Addr, Pool);
+  }
+  return Pool;
+}
+
 }  // extern "C"
 
 #endif  // FEX_IOS_HOST

@@ -1382,6 +1382,15 @@ void Decoder::AddBranchTarget(uint64_t Target) {
  * Addr unchanged when it is not inside a registered sub-floor window, so the
  * fast path is one compare. */
 extern "C" uint64_t IosSubfloorToReal(uint64_t Addr);
+#ifdef ARCHITECTURE_arm64ec
+/* ml1270: PE VA of a guest RWX/SMC page -> pool alias the Mach store emulator
+ * actually wrote. Identity when the page is not aliased or not writable. */
+extern "C" uint64_t IosJitSMCFetch(uint64_t Addr);
+#else
+static inline uint64_t IosJitSMCFetch(uint64_t Addr) {
+  return Addr;
+}
+#endif
 #endif
 
 const Decoder::DecodeStream Decoder::AdjustAddrForSpecialRegion(const uint8_t* _InstStream, uint64_t EntryPoint, uint64_t RIP) {
@@ -1455,6 +1464,19 @@ const Decoder::DecodeStream Decoder::AdjustAddrForSpecialRegion(const uint8_t* _
       return DecodeStream {
         .InstStream = _InstStream - EntryPoint + RIP,
         .AdjustedInstStream = reinterpret_cast<const uint8_t*>(RealRIP),
+      };
+    }
+  }
+  /* ml1270: iOS cannot grant W+X on a PE image page. Guest RWX of ntdll .data
+   * is host RX; x64 stores are Mach-emulated into the pool copy. Decode that
+   * copy so the bytes FEX runs are the bytes that were stored — DroidDeck's
+   * one mapping, expressed as a fetch alias. InstStream stays the guest RIP. */
+  {
+    const uint64_t Fetch = IosJitSMCFetch(RIP);
+    if (Fetch != RIP) {
+      return DecodeStream {
+        .InstStream = _InstStream - EntryPoint + RIP,
+        .AdjustedInstStream = reinterpret_cast<const uint8_t*>(Fetch),
       };
     }
   }
@@ -1644,6 +1666,29 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
                             BlockIt->BlockStatus == DecodedBlockStatus::UNIMPLEMENTED_INST ? "Unimplemented" :
                                                                                              "PartialDecode",
                             OpAddress);
+          /* Madeira ml1238: the address alone does not say whether the guest is
+           * executing real code, a data page, or code the image never shipped in
+           * decodable form. Dump the bytes actually being decoded plus the block
+           * entry, so the next report can be read without re-pulling the image.
+           * Bounded to 8 lines: this is a fatal path and must not flood. */
+          if (BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST) {
+            static uint32_t Dumps = 0;
+            if (Dumps < 8) {
+              ++Dumps;
+              constexpr int NumBytes = 16;
+              const char *HexDigits = "0123456789abcdef";
+              const uint8_t *P = &InstStream.AdjustedInstStream[0];
+              char Bytes[NumBytes * 3 + 1];
+              for (int i = 0; i < NumBytes; ++i) {
+                Bytes[i * 3 + 0] = HexDigits[P[i] >> 4];
+                Bytes[i * 3 + 1] = HexDigits[P[i] & 0xf];
+                Bytes[i * 3 + 2] = (i == NumBytes - 1) ? '\0' : ' ';
+              }
+              Bytes[NumBytes * 3] = '\0';
+              LogMan::Msg::EFmt("[entry-invalid] op={:X} entry={:X} decoded={} bytes={}",
+                                OpAddress, BlockIt->Entry, DecodedSize, Bytes);
+            }
+          }
         }
         break;
       }

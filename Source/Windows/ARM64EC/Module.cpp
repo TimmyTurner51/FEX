@@ -77,6 +77,8 @@ extern "C" int ios_va_log_len;
  * PE images are copied into the JIT pool. */
 extern "C" uint64_t IosJitTranslate(uint64_t Addr);
 extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
+extern "C" uint64_t IosJitSMCFetch(uint64_t Addr);
+extern "C" void IosJitSetSMCQuery(uint32_t (*fn)(uint64_t Addr));
 extern "C" uint64_t IosSubfloorToReal(uint64_t Addr);   // ml951
 extern "C" uint64_t IosSubfloorToLow(uint64_t Addr);    // ml951
 extern "C" uint64_t IosSubfloorClipSize(uint64_t LowAddr, uint64_t Size);  // ml951
@@ -955,6 +957,14 @@ static bool IosSmcStoreFastPath(FEXCore::Core::InternalThreadState* Thread, ARM6
 
 
 #ifdef FEX_IOS_HOST
+static uint32_t IosQuerySMCWritable(uint64_t Addr) {
+  if (!InvalidationTracker) {
+    return 0;
+  }
+  const auto Info = InvalidationTracker->QueryExecutableRange(Addr);
+  return (Info.Size && Info.Writable) ? 1u : 0u;
+}
+
 /* madeira-bcd: guest branch history v1. DATA, never a native-callable thunk. */
 /* Keep a word-sized global, matching the module's iOS relocation guards. */
 namespace FEXCore::Core { uint32_t IosGuestBranchTraceEnabled = 0; }
@@ -1076,7 +1086,7 @@ NTSTATUS ProcessInit() {
  * __DATE__/__TIME__ below is compiler-generated and therefore the
  * authoritative identity; if the two disagree, the tag is wrong, not the
  * build. */
-#define MADEIRA_REV "ml1269"
+#define MADEIRA_REV "ml1270"
   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MADEIRA_REV " compiled " __DATE__ " " __TIME__);
 #ifdef FEX_IOS_HOST
   /* ml751: flush the VA band selector's beacons.
@@ -1243,6 +1253,9 @@ NTSTATUS ProcessInit() {
   }
 #endif
   InvalidationTracker.emplace(*CTX, Threads);
+#ifdef FEX_IOS_HOST
+  IosJitSetSMCQuery(&IosQuerySMCWritable);
+#endif
   {
     // MADEIRA: hot SMC pages (InvalidationTracker::EnableHotSMCPages). MADEIRA_SMC_HOT_PAGE: unset = 64 write
     // faults within a second, 0 = off (every write to a code page invalidates it), N = threshold.
@@ -1820,6 +1833,17 @@ void NotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, BOOL 
   if (After) {
     // MEM_RESET(_UNDO) ignores the passed permissions
     if (!Status && !(Type & (MEM_RESET | MEM_RESET_UNDO))) {
+#ifdef FEX_IOS_HOST
+      const ULONG Exec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+      if (Size <= 0x10000 && !(Prot & Exec)) {
+        static std::atomic<uint32_t> N {0};
+        const uint32_t I = N.fetch_add(1, std::memory_order_relaxed);
+        if (I < 24) {
+          LogMan::Msg::EFmt("[iOS-prot] alloc addr={:#x} size={:#x} prot={:#x}", reinterpret_cast<uint64_t>(Address),
+                            static_cast<uint64_t>(Size), Prot);
+        }
+      }
+#endif
       InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), Prot);
     }
   }
@@ -1844,6 +1868,17 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After, 
 
   if (After) {
     if (!Status) {
+#ifdef FEX_IOS_HOST
+      const ULONG Exec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+      if (Size <= 0x10000 && !(NewProt & Exec)) {
+        static std::atomic<uint32_t> N {0};
+        const uint32_t I = N.fetch_add(1, std::memory_order_relaxed);
+        if (I < 24) {
+          LogMan::Msg::EFmt("[iOS-prot] protect addr={:#x} size={:#x} prot={:#x}", reinterpret_cast<uint64_t>(Address),
+                            static_cast<uint64_t>(Size), NewProt);
+        }
+      }
+#endif
       InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), NewProt);
     }
   }
