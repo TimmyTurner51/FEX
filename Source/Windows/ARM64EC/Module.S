@@ -114,7 +114,38 @@
 .globl IosRetToJit
 IosRetToJit:
   .word 0
+
+// ml1230: which route reached enter_jit.
+//
+// The 08:10 run proved the ARM64EC target is correct -- thunk slot rva 0x50650
+// holds 0x153b6c7fc (kernelbase+0x547fc) and the SEGV dump says [EC=1] -- yet
+// the call still reached enter_jit and branched to NULL. Both paths that
+// should have prevented that (the bitmap test's EC branch, and ml1222's
+// "FEX uninitialised + real target -> branch natively" guard) are supposed to
+// make enter_jit unreachable for this call, so reading the code cannot say
+// which one let it through. Each route stamps its own byte here and enter_jit
+// writes the record to stderr once, so one run names the gate instead of
+// another round of inference.
+//
+//   '1' check_target_ec   -- the pre-ExitToX64 dispatch_call bitmap test
+//   '2' ios_ffs_reject    -- thunk-reject path (guard declined)
+//   '3' ios_ffs_no_bypass -- no x64 thunk shape matched at all
+.balign 8
+.globl IosJitGateMsg
+IosJitGateMsg:
+  .ascii "\n[jit-gate] "
+  .byte 0x30                      // offset 12: the route tag
+  .byte 0x0a                      // offset 13: newline
 .text
+
+// Stamp the route tag. x16/x17 are IP0/IP1: dead at every call boundary and
+// unused by the tail of each route below.
+.macro IOS_SET_GATE imm
+  adrp x16, IosJitGateMsg
+  add x16, x16, #:lo12:IosJitGateMsg
+  mov w17, #\imm
+  strb w17, [x16, #12]
+.endm
 #endif
 
   // __os_arm64x_x64_jump in ARM64EC docs
@@ -152,6 +183,9 @@ check_target_ec:
   lsr x17, x9, #12
   lsr x16, x16, x17
   tbnz x16, #0, ExitFunctionEC
+#ifdef FEX_IOS_HOST
+  IOS_SET_GATE 0x31               // ml1230: dispatch_call bitmap said "not EC"
+#endif
   b enter_jit
 
   // __os_arm64x_dispatch_call_no_redirect in ARM64EC docs
@@ -707,6 +741,7 @@ ios_ffs_xlate_done:
   str x17, [x16, #8]     // [1] = last EC target taken natively
   br x17                 // PE VA; the Mach exec-fault redirect maps it to the pool copy
 ios_ffs_reject:
+  IOS_SET_GATE 0x32               // ml1230: thunk reject (ml1222 guard declined)
   // Pattern matched but the (PE-space) target is not EC per the bitmap: fall
   // through to normal emulation -- correct for genuine x64 jmp targets -- but
   // COUNT it, so a run with zero bypasses is distinguishable from one where the
@@ -720,12 +755,39 @@ ios_ffs_reject_count:
   str x23, [x16, #16]    // [2] = matched-but-rejected count
   str x17, [x16, #24]    // [3] = last rejected (PE-space) target
 ios_ffs_no_bypass:
+  // ml1230: default route tag, but never overwrite an earlier stamp -- the
+  // reject path arrives here too and '2' is the more specific answer.
+  adrp x16, IosJitGateMsg
+  add x16, x16, #:lo12:IosJitGateMsg
+  ldrb w17, [x16, #12]
+  cbnz w17, 77f
+  IOS_SET_GATE 0x33               // no x64 thunk shape matched
+77:
   IOS_XP_COUNT 2112, x16, x17   // ml1131: EC->x64 call (callback) emulated
 #endif
   str lr, [sp, #-8]! // Push return address to stack, this will be popped by the x86 RET instr.
 
 enter_jit:
 #ifdef FEX_IOS_HOST
+  // ml1230: publish the route that got here, before anything else runs.
+  //
+  // Raw Darwin write(2) through svc #0x80: fd 2 at the unix layer is the
+  // madeira-log.txt that ntdll-unix already writes to, so this needs no CRT,
+  // no import table and no TEB. x0-x5 are RCX/RDX/R8/R9 and the ARM64EC
+  // variadic descriptor, so they are spilled rather than assumed dead; the
+  // frame is a multiple of 16 so sp alignment is unchanged.
+  stp x0, x1, [sp, #-48]!
+  stp x2, x3, [sp, #16]
+  stp x4, x5, [sp, #32]
+  adrp x1, IosJitGateMsg
+  add x1, x1, #:lo12:IosJitGateMsg
+  mov x0, #2                      // fd 2
+  mov x2, #14                     // "\n[jit-gate] X\n"
+  mov w16, #4                     // syscall 4 == write
+  svc #0x80
+  ldp x4, x5, [sp, #32]
+  ldp x2, x3, [sp, #16]
+  ldp x0, x1, [sp], #48
   IOS_LOAD_TEB x17
   ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
 #else
