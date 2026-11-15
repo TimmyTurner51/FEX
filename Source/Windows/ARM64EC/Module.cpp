@@ -87,8 +87,16 @@ static uint64_t IosEcCodeBitMapValue = 0;
 /* ml316: FFS-bypass diagnostics, written by ExitToX64's bypass path in Module.S:
  * [0] = native short-circuits taken, [1] = last EC target,
  * [2] = FFS matched but target not EC (fell through to emulation), [3] = last such
- * target. Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
-extern "C" uint64_t IosFfsBypassLog[4];
+ * target.
+ * [4] = raw (non-thunk) callees taken natively by ios_ec_entry, [5] = last such.
+ * [6] = import slots whose value could not be resolved to a native fast-forward
+ *       body, [7] = last such slot value. [6] is the counter that says the
+ *       fast-forward fix was reached and did NOT apply, and [7] names what the
+ *       slot actually held -- without it a repeat of the pc=0 would be
+ *       unexplained, since the register probe lives in the app binary and does
+ *       not ship with a FEX component.
+ * Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
+extern "C" uint64_t IosFfsBypassLog[20];
 /* Defined in FEXCore Arm64Emitter.cpp; read when the dispatcher and blocks are emitted. */
 extern "C" uint32_t IosEcReturnWithRet;
 
@@ -101,7 +109,11 @@ extern "C" uint32_t IosCallRetStackElided;
 /* uint32_t, not bool: a 1-byte global here misaligned the adrp/ldr pair
  * lld generates for the neighbouring word ("misaligned ldr/str offset"). */
 static uint32_t IosTebTsdImportFound = 0;
-uint64_t IosFfsBypassLog[4] {};
+/* ml1212: 16 entries now. [12] counts slot values read successfully from the PE
+ * view, [13] counts times the sub-0x100000 "this is an rva, not an address"
+ * guard turned a value away -- between them they say whether ExitToX64's new
+ * PE-side read ran and whether the value it found looked bound. */
+uint64_t IosFfsBypassLog[20] {};
 /* ml1131: transition probe, written by Module.S and read by wine's ntdll-unix
  * sampler through this DATA export (libarm64ecfex_ios.def). Layout in bytes:
  *   0     magic 'MADXPFEX' (set in ProcessInit)
@@ -784,6 +796,17 @@ public:
     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
   }
 
+  // MADEIRA fh6-fex 0001: with full SMC the block already validated its own bytes, so only it has
+  // to go. Anything else keeps the page-wide invalidation above.
+  void InvalidateGuestBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Entry) override {
+    FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
+    if (SMCChecks != FEXCore::Config::CONFIG_SMC_FULL) {
+      InvalidateGuestCodeRange(Thread, Entry, 1);
+      return;
+    }
+    InvalidationTracker->InvalidateGuestBlock(Entry);
+  }
+
   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
     OvercommitTracker->MarkRange(Start, Length);
   }
@@ -1316,7 +1339,148 @@ NTSTATUS ProcessInit() {
 void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
   if (!After) {
     ProcessTerminating.store(true, std::memory_order_relaxed);
+    /* ml1212: dump the ExitToX64 dispatch counters on the way out.
+     *
+     * These live in Module.S and were effectively write-only: nothing could read
+     * them, because LogMan's messages never reach madeira-log.txt in this build
+     * (Msg::MFmtImpl drops them when the allocator looks dead, and the [ffs-*]
+     * reporters in Core.cpp sit behind that). The game dies in its own
+     * pseudo-process, but ntdll still calls this on the way down, so the numbers
+     * survive the crash and name the stage that failed:
+     *
+     *   slot=0                 never even reached the import-slot path
+     *   slot>0, follow=0       a slot value was produced but held no x64 FFS
+     *   follow>0, bypass=0     the FFS was unwrapped and the target still lost
+     *   peread=0               the PE-view read never ran (pool fallback used)
+     *   rva>0                  the guard saw a value too small to be an address
+     *
+     * WriteFile to the PEB's hStdError is the channel [fex-arena] already uses. */
+    static bool Dumped = false;
+    if (!Dumped) {
+      Dumped = true;
+      HANDLE h = nullptr;
+      if (auto Peb = NtCurrentTeb() ? NtCurrentTeb()->ProcessEnvironmentBlock : nullptr) {
+        if (auto Params = reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(Peb->ProcessParameters)) {
+          h = reinterpret_cast<HANDLE>(Params->hStdError);
+        }
+      }
+      if (h) {
+        static const char kLabels[20][9] = {
+          "bypass", "bypLast", "reject", "rejLast", "ecEnt", "ecEntLst",
+          "slot",   "slotLast", "follow", "folLast", "slotCopy", "peread",
+          "pereadOK", "rvaGuard", "peSlot", "peValue", "peRel32", "peDerive",
+          "x18", "x19",
+        };
+        char buf[80 + 20 * 24];
+        int n = 0;
+        const char* tag = "[ffs-log] ";
+        while (*tag) buf[n++] = *tag++;
+        const char hexd[] = "0123456789abcdef";
+        for (int i = 0; i < 20; ++i) {
+          for (const char* p = kLabels[i]; *p; ++p) buf[n++] = *p;
+          buf[n++] = '=';
+          buf[n++] = '0';
+          buf[n++] = 'x';
+          for (int j = 60; j >= 0; j -= 4) buf[n++] = hexd[(IosFfsBypassLog[i] >> j) & 0xf];
+          buf[n++] = (i == 19) ? '\n' : ' ';
+        }
+        ULONG written = 0;
+        WriteFile(h, buf, n, &written, nullptr);
+      }
+    }
   }
+}
+
+/* ml1216: the ONLY channel that provably reaches madeira-log.txt from a PE
+ * module is ntdll's __wine_dbg_output -- it is what Wine's own ERR() uses, and
+ * every 0024:err: line in the log is proof it lands. Two things this file was
+ * relying on before are dead ends:
+ *
+ *   - WriteFile( PEB->hStdError ): measured dead. None of this file's strings
+ *     ([FEX-iOS], DispatcherPatch, ThreadInit() done) has ever appeared in a
+ *     log, and the [fex-arena] lines that looked like evidence actually come
+ *     from build/ntdll-unix/virtual_ios.c's dprintf(2).
+ *   - Logging.cpp resolves __wine_dbg_output and then never calls it, because
+ *     its FEX_IOS_HOST branch returns through IosLogWrite (same dead WriteFile).
+ *
+ * So resolve __wine_dbg_output here and call it directly. Cached: the resolver
+ * runs once, and every later call is a plain indirect branch. */
+/* ml1217: emit through a raw Darwin write(2) syscall.
+ *
+ * __wine_dbg_output does not resolve through GetProcAddress here -- Logging.cpp
+ * says so in a comment and ml1216 measured it: ResetToConsistentState relocated
+ * (rva 0x114c3c -> 0x113d50, matching the log's rtcs base+offset), so the dump
+ * ran, and still nothing printed. WriteFile to PEB stderr is equally dead.
+ *
+ * A direct syscall needs no CRT table, no import and no TEB: fd 2 is inherited
+ * from the unix side, which is exactly how dprintf(2) in build/ntdll-unix
+ * reaches the log. Falling back to WriteFile keeps a host that denies the
+ * syscall from going silent. */
+static void IosFfsEmit(const char* s) {
+    int len = 0;
+    while (s[len]) ++len;
+    long rc;
+    register long x0 __asm__("x0") = 2;                 /* stderr */
+    register long x1 __asm__("x1") = (long)(intptr_t)s;
+    register long x2 __asm__("x2") = len;
+    register long x16 __asm__("x16") = 4;               /* Darwin SYS_write */
+    __asm__ volatile("svc #0x80"
+                     : "+r"(x0), "+r"(x16)
+                     : "r"(x1), "r"(x2)
+                     : "memory", "cc");
+    rc = x0;
+    if (rc == len) return;
+    auto Teb = NtCurrentTeb();
+    if (!Teb || !Teb->ProcessEnvironmentBlock) return;
+    auto Params = reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
+        Teb->ProcessEnvironmentBlock->ProcessParameters);
+    if (!Params) return;
+    HANDLE h = reinterpret_cast<HANDLE>(Params->hStdError);
+    if (!h) return;
+    ULONG written = 0;
+    WriteFile(h, s, static_cast<DWORD>(len), &written, nullptr);
+}
+
+/* ml1215: dump ExitToX64's dispatch counters from inside FEX.
+ *
+ * The counters in Module.S were unreadable three times over: FEX's own reporters
+ * go through LogMan (messages never reach madeira-log.txt here), the ProcessTerm
+ * dump never runs because an unhandled exception tears the pseudo-process down
+ * without it, and the ntdll-side dump cannot ship at all -- a .wcp component
+ * replaces files in the PREFIX, but ntdll is loaded from the app bundle.
+ *
+ * ntdll does call THIS function on the faulting exception, which is proven
+ * rather than assumed: ResetToConsistentState is at rva 0x114c3c in this DLL and
+ * the log's rtcs=0x153611C3C is exactly pool base 0x1534fd000 + 0x114c3c. */
+static void IosFfsDumpOnce(const char* why) {
+    static volatile int Dumped = 0;
+    if (__atomic_exchange_n(const_cast<int*>(&Dumped), 1, __ATOMIC_ACQ_REL) != 0) return;
+    char buf[96 + 20 * 24];
+    int n = 0;
+    for (const char* p = "[ffs-log] "; *p; ++p) buf[n++] = *p;
+    for (const char* p = why; *p; ++p) buf[n++] = *p;
+    buf[n++] = '\n';
+    buf[n] = 0;
+    IosFfsEmit(buf);
+    static const char kLabels[20][10] = {
+      "bypass", "bypLast", "reject", "rejLast", "ecEnt", "ecEntLst",
+      "slot",   "slotLast", "follow", "folLast", "slotCopy", "peread",
+      "pereadOK", "rvaGuard", "peSlot", "peValue", "peRel32", "peDerive",
+      "preCanon", "postCanon",
+    };
+    n = 0;
+    for (const char* p = "[ffs-log] "; *p; ++p) buf[n++] = *p;
+    const char hexd[] = "0123456789abcdef";
+    for (int i = 0; i < 20; ++i) {
+        for (const char* p = kLabels[i]; *p; ++p) buf[n++] = *p;
+        buf[n++] = '=';
+        buf[n++] = '0';
+        buf[n++] = 'x';
+        for (int j = 60; j >= 0; j -= 4) buf[n++] = hexd[(IosFfsBypassLog[i] >> j) & 0xf];
+        buf[n++] = (i == 19) ? '\n' : ' ';
+    }
+    buf[n] = 0;
+    IosFfsEmit(buf);
 }
 
 class ScopedCallbackDisable {
@@ -1338,6 +1502,9 @@ public:
 // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
 bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
   auto Thread = CPUArea.ThreadState();
+  /* ml1215: the one hook that provably runs on the faulting exception and can
+   * reach the log. Records the dispatch counters before anything else here. */
+  IosFfsDumpOnce("fault");
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedSignalTime);
   /* ml1039: an access violation is only diagnosable with its DATA address. "Address" is the faulting PC; the
    * operand lives in ExceptionInformation[0]=read/write/execute and [1]=address, and leaving them out cost a
@@ -1581,6 +1748,16 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
 
 NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
   bool Cont {};
+  /* ml1219: dump the ExitToX64 counters HERE, not in ResetToConsistentStateImpl.
+   *
+   * Impl is only reached when the thread has FEX state, and the fault this dump
+   * exists to explain is precisely the one where it does not: the null-state
+   * bail below returns STATUS_SUCCESS first, so ml1215's IosFfsDumpOnce at the
+   * top of Impl never ran in any ml1215..ml1218 session -- which is why every
+   * run since has been silent about [12]/[13]/[14]/[15] even though the write
+   * path itself is sound. Reached here, the same svc reaches fd 2 exactly like
+   * the ntdll dprintf calls that do appear in the log. */
+  IosFfsDumpOnce("rtcs");
   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);
 

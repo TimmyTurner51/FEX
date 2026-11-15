@@ -27,6 +27,20 @@ extern "C" void ios_fex_mono_arm(uint64_t Base, uint64_t End);
 extern "C" int IosSubfloorEnum(int Index, uint64_t* Low, uint64_t* Real, uint64_t* Size);  // ml1207, IosJitAlias.cpp
 #endif
 
+#ifdef FEX_IOS_HOST
+/* MADEIRA 16K traps: the iOS host page is 16 KB and Wine gives it the union of its four 4 KB
+ * pages' protections. A write trap armed on one 4 KB page left the host page writable whenever
+ * a sibling was untrapped (or hot), so writes to the trapped page were never seen and stale
+ * translations ran on: Project Zomboid's JVM, its code cache plain memory ([x64-rwx]), sat in
+ * Runtime1::patch_code at 100% because C1's patched call sites kept running the old code.
+ * The Escapists 2 (WOW64, Mono's call patch looped ~40,000 times a second) had the same bug.
+ * So traps are armed and released, write faults invalidate, and pages turn hot per host page. */
+static constexpr uint64_t MADEIRA_TRAP_PAGE_SIZE = 0x4000;
+#else
+static constexpr uint64_t MADEIRA_TRAP_PAGE_SIZE = FEXCore::Utils::FEX_PAGE_SIZE;
+#endif
+static constexpr uint64_t MADEIRA_TRAP_PAGE_MASK = ~(MADEIRA_TRAP_PAGE_SIZE - 1);
+
 namespace FEX::Windows {
 uint64_t InvalidationTracker::OwnedSharedMutex::Self() {
 #ifdef FEX_IOS_HOST
@@ -511,6 +525,14 @@ void InvalidationTracker::ReprotectRWXIntervals(uint64_t Address, uint64_t Size)
   ProtectRWXIntervalsInternal(Address, Size, false);
 }
 
+void InvalidationTracker::InvalidateGuestBlock(uint64_t Entry) {
+  std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
+  CTX.InvalidateCodeBuffersBlock(Entry);
+  for (auto Thread : Threads) {
+    CTX.InvalidateThreadCachedBlock(Thread.second, Entry);
+  }
+}
+
 bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc, uint64_t FaultAddress,
                                                    bool* HotPage) {
   const auto [NeedsInvalidate, UntrapProt] = [&](uint64_t Address) -> std::pair<bool, ULONG> {
@@ -537,25 +559,37 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
   if (NeedsInvalidate) {
     // MADEIRA: a page that turns hot here is invalidated below as usual, once: from then on nothing
     // compiled from it relies on the write trap.
-    if (CountSMCWriteFault(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK)) {
+    if (CountSMCWriteFault(FaultAddress & MADEIRA_TRAP_PAGE_MASK)) {
       static std::atomic<uint32_t> HotLogCount {0};
       if (HotLogCount.fetch_add(1, std::memory_order_relaxed) < 16) {
         LogMan::Msg::EFmt("[smc-hot] page {:#x} took {} write faults within a second: no longer write-protected, its blocks "
                           "validate their code per instruction (MADEIRA_SMC_HOT_PAGE=0 disables)",
-                          FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, HotPageThreshold);
+                          FaultAddress & MADEIRA_TRAP_PAGE_MASK, HotPageThreshold);
       }
     }
     // IntervalsLock cannot be held during invalidation
     {
       const bool Locked = LockCodeInvalidationUnlessHeld("write-fault", FaultAddress);
 
-      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+      const uint64_t TrapPage = FaultAddress & MADEIRA_TRAP_PAGE_MASK;
+      InvalidateIntervalInternalLocked(TrapPage, MADEIRA_TRAP_PAGE_SIZE);
 
       // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
-      ULONG TmpProt;
-      void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
-      SIZE_T TmpSize = 1;
-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
+      // MADEIRA 16K traps: every RWX 4 KB page of the host page, each with its own untrap protection.
+      for (uint64_t Page = TrapPage; Page < TrapPage + MADEIRA_TRAP_PAGE_SIZE; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+        ULONG PageUntrapProt = UntrapProt;
+        if ((Page ^ FaultAddress) & FEXCore::Utils::FEX_PAGE_MASK) {
+          std::shared_lock Lock(IntervalsLock);
+          if (!RWXIntervals.Query(Page).Enclosed) {
+            continue;
+          }
+          PageUntrapProt = GetUntrapProt(Page);
+        }
+        ULONG TmpProt;
+        void* TmpAddress = reinterpret_cast<void*>(Page);
+        SIZE_T TmpSize = FEXCore::Utils::FEX_PAGE_SIZE;
+        NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, PageUntrapProt, &TmpProt);
+      }
       if (Locked) {
         CTX.GetCodeInvalidationMutex().unlock();
       }
@@ -580,7 +614,7 @@ bool InvalidationTracker::IsHotSMCPage(uint64_t Address) const {
   if (!Used) {
     return false;
   }
-  const auto Page = Address & FEXCore::Utils::FEX_PAGE_MASK;
+  const auto Page = Address & MADEIRA_TRAP_PAGE_MASK;
   for (uint32_t i = 0; i < Used; ++i) {
     if (HotPages[i].load(std::memory_order_acquire) == Page) {
       return true;
@@ -600,7 +634,7 @@ bool InvalidationTracker::CountSMCWriteFault(uint64_t Page) {
   }
 
   // Direct-mapped: a page evicted by another one simply starts counting again.
-  auto& Slot = HotFaults[(Page >> FEXCore::Utils::FEX_PAGE_SHIFT) % HotFaultSlots];
+  auto& Slot = HotFaults[(Page / MADEIRA_TRAP_PAGE_SIZE) % HotFaultSlots];
   if (Slot.Page != Page || Now - Slot.WindowStart > Frequency) {
     Slot = {Page, Now, 0};
   }
@@ -964,7 +998,10 @@ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uin
 }
 
 bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked) {
-  const auto End = Address + Size;
+  // MADEIRA 16K traps: whole host pages, see HandleRWXAccessViolation.
+  const auto End = (Address + Size + MADEIRA_TRAP_PAGE_SIZE - 1) & MADEIRA_TRAP_PAGE_MASK;
+  Address &= MADEIRA_TRAP_PAGE_MASK;
+  Size = End - Address;
   std::shared_lock Lock(IntervalsLock);
 
   if (SMCDetectionDisabled) {
@@ -998,12 +1035,12 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
       } else {
         // MADEIRA: never write-protect a hot page again; protect the runs of pages around it.
         uint64_t RunBegin = Address;
-        for (uint64_t Page = Address & FEXCore::Utils::FEX_PAGE_MASK; Page < ProtectEnd; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+        for (uint64_t Page = Address & MADEIRA_TRAP_PAGE_MASK; Page < ProtectEnd; Page += MADEIRA_TRAP_PAGE_SIZE) {
           if (IsHotSMCPage(Page)) {
             if (RunBegin < std::max(Page, Address)) {
               Protect(RunBegin, std::max(Page, Address));
             }
-            RunBegin = std::min(Page + FEXCore::Utils::FEX_PAGE_SIZE, ProtectEnd);
+            RunBegin = std::min(Page + MADEIRA_TRAP_PAGE_SIZE, ProtectEnd);
           }
         }
         if (RunBegin < ProtectEnd) {

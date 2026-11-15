@@ -44,5 +44,10 @@ EXPORTS
   ios_fex_band_end DATA
   ; ml1131: transition probe counters (Module.S), read by ntdll-unix's [xp-api] sampler.
   IosXpFex DATA
+  ; ml1214: ExitToX64 dispatch counters (Module.S), read by ntdll's [ffs-log] dump at
+  ; the faulting exception -- FEX's own reporters go through LogMan, which never
+  ; reaches madeira-log.txt, and ProcessTerm does not run on an unhandled-exception
+  ; teardown, so this is the only channel that can report them.
+  IosFfsBypassLog DATA
   ; madeira-bcd: guest branch history v1
   IosGuestBranchTraceLayout DATA

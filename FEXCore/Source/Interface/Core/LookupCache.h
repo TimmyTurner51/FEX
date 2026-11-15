@@ -2,6 +2,7 @@
 #pragma once
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include "Interface/Context/Context.h"
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/SHMStats.h>
@@ -146,11 +147,14 @@ struct GuestToHostMap {
     return BlockList.erase(Address) != 0;
   }
 
-  void InvalidateRange(uint64_t Start, uint64_t Length) {
+  bool InvalidateRange(uint64_t Start, uint64_t Length) {
     auto lk = AcquireWriteLock();
 
     auto lower = CodePages.lower_bound(Start >> 12);
     auto upper = CodePages.upper_bound((Start + Length - 1) >> 12);
+    if (lower == upper) {
+      return false;
+    }
 
     for (auto it = lower; it != upper; it++) {
       for (const auto& Entry : it->second) {
@@ -158,6 +162,32 @@ struct GuestToHostMap {
       }
     }
     CodePages.erase(lower, upper);
+    return true;
+  }
+
+  // MADEIRA fh6-fex 0001: erases every block entry whose guest address falls inside
+  // [Start, Start + Length), even when the reverse page bookkeeping (CodePages) is out of sync
+  // with the forward block list. A protection change can announce itself before the write it
+  // covers, leaving a block with no page entry that a page-range sweep therefore never reaches.
+  void EraseEntriesInRange(uint64_t Start, uint64_t Length, const LookupCacheWriteLockToken& lk) {
+    fextl::vector<uint64_t> Entries;
+    if (Length < BlockList.size()) {
+      const uint64_t End = Start + Length;
+      for (uint64_t Address = Start; Address != End; ++Address) {
+        if (BlockList.find(Address) != BlockList.end()) {
+          Entries.push_back(Address);
+        }
+      }
+    } else {
+      for (const auto& [Address, Entry] : BlockList) {
+        if (Address >= Start && Address - Start < Length) {
+          Entries.push_back(Address);
+        }
+      }
+    }
+    for (const auto Address : Entries) {
+      Erase(Address, lk);
+    }
   }
 
   void AddBlockLink(uint64_t GuestDestination, FEXCore::Context::ExitFunctionLinkData* HostLink,
@@ -403,6 +433,62 @@ public:
     bool ret = upper != lower;
     CachedCodePages.erase(lower, upper);
     return ret;
+  }
+
+  // MADEIRA fh6-fex 0001: drops one entry even when it has no executable-page bookkeeping. A
+  // stale boundary entry cannot be reached through the page-based range index.
+  bool InvalidateBlock(uint64_t Address) {
+    auto lk = Shared->AcquireWriteLock();
+    const bool Removed = Shared->Erase(Address, lk);
+    InvalidateCache(Address, lk);
+    return Removed;
+  }
+
+  // Drops this thread's L1/L2 entry for one block; the shared map is the caller's job.
+  void InvalidateCachedBlock(uint64_t Address) {
+    auto lk = Shared->AcquireWriteLock();
+    InvalidateCache(Address, lk);
+  }
+
+  // MADEIRA fh6-fex 0001: sweeps the concrete lookup layers for a range. Used when execution is
+  // about to resume after a write the tracker could not attribute to a page.
+  void InvalidateUntrackedRange(uint64_t Start, uint64_t Length) {
+    auto lk = Shared->AcquireWriteLock();
+    Shared->EraseEntriesInRange(Start, Length, lk);
+
+    const uint64_t End = Start + Length;
+    auto* L1Entries = reinterpret_cast<LookupCacheEntry*>(L1Pointer);
+    if (Length < CurrentL1Entries) {
+      // L1 is direct-mapped by guest address, so only these slots can hold the range.
+      for (uint64_t Address = Start; Address != End; ++Address) {
+        auto& L1Entry = L1Entries[Address & L1PointerMask];
+        if (L1Entry.GuestCode == Address) {
+          L1Entry.GuestCode = 0;
+        }
+      }
+    } else {
+      for (size_t i = 0; i < CurrentL1Entries; ++i) {
+        const uint64_t Address = L1Entries[i].GuestCode;
+        if (Address >= Start && Address < End) {
+          L1Entries[i].GuestCode = 0;
+        }
+      }
+    }
+
+    if (!DisableL2Cache()) {
+      auto* Pointers = reinterpret_cast<uintptr_t*>(PagePointer);
+      const uint64_t FirstPage = Start >> 12;
+      const uint64_t LastPage = (End - 1) >> 12;
+      for (uint64_t Page = FirstPage; Page <= LastPage; ++Page) {
+        const uint64_t PageIndex = (Page << 12 & (VirtualMemSize - 1)) >> 12;
+        if (const uintptr_t LocalPagePointer = Pointers[PageIndex]) {
+          auto* Entries = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
+          const size_t FirstOffset = Page == FirstPage ? Start & 0xfff : 0;
+          const size_t LastOffset = Page == LastPage ? ((End - 1) & 0xfff) + 1 : 0x1000;
+          memset(Entries + FirstOffset, 0, (LastOffset - FirstOffset) * sizeof(LookupCacheEntry));
+        }
+      }
+    }
   }
 
   void AddBlockLink(uint64_t GuestDestination, FEXCore::Context::ExitFunctionLinkData* HostLink,
