@@ -769,25 +769,40 @@ ios_ffs_no_bypass:
 
 enter_jit:
 #ifdef FEX_IOS_HOST
-  // ml1230: publish the route that got here, before anything else runs.
+  // ml1231: publish the route that got here, before anything else runs.
   //
   // Raw Darwin write(2) through svc #0x80: fd 2 at the unix layer is the
   // madeira-log.txt that ntdll-unix already writes to, so this needs no CRT,
   // no import table and no TEB. x0-x5 are RCX/RDX/R8/R9 and the ARM64EC
-  // variadic descriptor, so they are spilled rather than assumed dead; the
-  // frame is a multiple of 16 so sp alignment is unchanged.
-  stp x0, x1, [sp, #-48]!
-  stp x2, x3, [sp, #16]
-  stp x4, x5, [sp, #32]
+  // variadic descriptor, so they are spilled rather than assumed dead.
+  //
+  // ml1231 fixes an alignment fault that made the FIRST build of this fault
+  // here instead of reporting: enter_jit is entered with sp at 8 mod 16 (the
+  // `str x30,[sp,#-8]!` just above pushes one register), and `stp ...,[sp,#-n]!`
+  // with SP as the writeback base requires 16-byte alignment -- the SEGV log
+  // showed BUS_ADRALN on this very instruction, a9bd07e0 at enter_jit+0.
+  // Plain 8-byte str/ldr and a `sub sp` (which has no alignment requirement)
+  // work whatever alignof(sp-16) is, and the frame is restored exactly.
+  sub sp, sp, #0x40
+  str x0, [sp]
+  str x1, [sp, #8]
+  str x2, [sp, #16]
+  str x3, [sp, #24]
+  str x4, [sp, #32]
+  str x5, [sp, #40]
   adrp x1, IosJitGateMsg
   add x1, x1, #:lo12:IosJitGateMsg
   mov x0, #2                      // fd 2
   mov x2, #14                     // "\n[jit-gate] X\n"
   mov w16, #4                     // syscall 4 == write
   svc #0x80
-  ldp x4, x5, [sp, #32]
-  ldp x2, x3, [sp, #16]
-  ldp x0, x1, [sp], #48
+  ldr x0, [sp]
+  ldr x1, [sp, #8]
+  ldr x2, [sp, #16]
+  ldr x3, [sp, #24]
+  ldr x4, [sp, #32]
+  ldr x5, [sp, #40]
+  add sp, sp, #0x40
   IOS_LOAD_TEB x17
   ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
 #else
