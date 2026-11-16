@@ -915,6 +915,9 @@ int64_t WriteOffset = 0;
 #endif
 
 #ifdef FEX_IOS_HOST
+extern "C" NTSYSAPI NTSTATUS NTAPI NtWriteVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress, const void* Buffer,
+                                                        SIZE_T NumberOfBytesToWrite, PSIZE_T NumberOfBytesWritten);
+
 /* madeira-bcd: smc-store-fastpath v1. On the iOS SMC path (ml657 below) a
  * plain store, or one FEX already backpatched to DMB + STR, used to enter
  * HandleUnalignedAccess, which takes the backpatch lock in the code buffer
@@ -925,6 +928,53 @@ int64_t WriteOffset = 0;
  * FEXCore's (Arm64.cpp: LDSTUNSCALED_MASK/STUR_INST, LDSTREGISTER_MASK/
  * STR_INST, DMB); the build overlay refuses a changed handler. */
 static bool IosSmcFastPath = true;
+
+/* FH6 18:05: Denuvo stores an 8-byte decrypt pointer into ntdll .data after
+ * VirtualProtect(RWX). The PE view is file-backed RX (iOS never grants W+X),
+ * and the Mach emulator only dual-maps anon JIT aliases — not the PE→pool
+ * memcpy copy. The store faults, this path used to claim it and retry without
+ * writing. Complete it through the pool RW alias (DroidDeck's one mapping)
+ * and NtWrite the PE view so a later x64 load of that slot sees the pointer. */
+static bool IosCompleteAliasedSmc(ARM64_NT_CONTEXT& Context, uint64_t FaultAddress, bool IsWrite) {
+  const uint64_t Pool = IosJitTranslate(FaultAddress);
+  if (Pool == FaultAddress) {
+    return false;
+  }
+  const uint32_t Insn = *reinterpret_cast<const uint32_t*>(Context.Pc);
+  unsigned Size = 0;
+  if ((Insn & 0x3FC00000) == 0x39000000) {
+    Size = 1u << ((Insn >> 30) & 3); /* STRB/H/W/X [Xn, #imm] */
+  } else if ((Insn & 0x3B200C00) == 0x38000000) {
+    Size = 1u << ((Insn >> 30) & 3); /* STUR* */
+  } else {
+    return false;
+  }
+  const unsigned Rt = Insn & 31;
+  uint8_t* RW = reinterpret_cast<uint8_t*>(Pool) + FEXCore::DualMap::WriteOffset;
+  uint64_t Value = 0;
+  if (IsWrite) {
+    if (Rt != 31) {
+      Value = Context.X[Rt];
+    }
+    memcpy(RW, &Value, Size);
+    SIZE_T Wrote = Size;
+    NtWriteVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(FaultAddress), &Value, Size, &Wrote);
+  } else {
+    memcpy(&Value, reinterpret_cast<void*>(Pool), Size);
+    if (Rt != 31) {
+      Context.X[Rt] = Value;
+    }
+  }
+  Context.Pc += 4;
+  static std::atomic<uint32_t> N {0};
+  const uint32_t I = N.fetch_add(1, std::memory_order_relaxed);
+  if (I < 24) {
+    LogMan::Msg::EFmt("[ios-smc-store] #{} {} pe={:#x} pool={:#x} rw={:#x} size={} val={:#x} pc={:#x}", I + 1,
+                      IsWrite ? "write" : "read", FaultAddress, Pool, reinterpret_cast<uint64_t>(RW), Size, Value,
+                      Context.Pc - 4);
+  }
+  return true;
+}
 
 static bool IosSmcStoreFastPath(FEXCore::Core::InternalThreadState* Thread, ARM64_NT_CONTEXT& Context) {
   if (!IosSmcFastPath) {
@@ -1086,7 +1136,7 @@ NTSTATUS ProcessInit() {
  * __DATE__/__TIME__ below is compiler-generated and therefore the
  * authoritative identity; if the two disagree, the tag is wrong, not the
  * build. */
-#define MADEIRA_REV "ml1270"
+#define MADEIRA_REV "ml1272"
   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MADEIRA_REV " compiled " __DATE__ " " __TIME__);
 #ifdef FEX_IOS_HOST
   /* ml751: flush the VA band selector's beacons.
@@ -1570,6 +1620,12 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
     bool IosSmcSay = true;
     bool SmcHotPage = false;
     if (InvalidationTracker && InvalidationTracker->HandleRWXAccessViolation(Thread, NativeContext->Pc, FaultAddress, &SmcHotPage)) {
+#ifdef FEX_IOS_HOST
+      if (IosCompleteAliasedSmc(*NativeContext, FaultAddress, Exception->ExceptionInformation[0] != 0)) {
+        if (IosDeferAvLog) IosLogAv();
+        return true;
+      }
+#endif
       {
         const uint64_t N = IosSmcHandled.fetch_add(1, std::memory_order_relaxed) + 1;
         IosSmcSay = N <= 40 || (N % 1000) == 0;
