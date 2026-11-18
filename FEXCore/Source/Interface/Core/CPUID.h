@@ -42,8 +42,37 @@ public:
       return (this->*Handler)(Leaf);
     }
 
+    /* Madeira ml1253: WHEN THE HYPERVISOR BIT IS HIDDEN, HIDE THE HYPERVISOR LEAVES TOO.
+     *
+     * FEX_HIDEHYPERVISORBIT exists so a title that misbehaves under emulation can be
+     * told it is running on bare metal, and it clears CPUID.1[31] as advertised. The
+     * 0x40000000 range was left untouched, so the option defeated itself: a guest that
+     * asks the standard "which hypervisor am I under" question got
+     *
+     *   0x40000000: eax = 0x40000001, signature "FEXIFEXIEMU"
+     *   0x40000001: eax[3:0] = 2 = "the host architecture is AArch64"
+     *
+     * while leaf 1 said no hypervisor was present. Those two answers cannot both be
+     * true on a real machine, so the inconsistency is itself the fingerprint -- and it
+     * is a more reliable one than the bit, because software that checks for emulation
+     * asks the hypervisor leaves precisely because they are cheap to forge and easy to
+     * read. Anti-tamper code in a protected title reaches an unambiguous "you are under
+     * FEX" verdict and declines to decrypt its own functions, which presents as a
+     * permanent #UD at a prologue whose file bytes are still ciphertext.
+     *
+     * With the hypervisor bit hidden, the correct answer for this range is "no
+     * hypervisor leaves", which is eax = 0 and everything else zero: the same shape a
+     * real machine returns for an unimplemented leaf, and what Function_Reserved below
+     * already returns. Behaviour without the option is unchanged, so nothing that
+     * currently relies on FEX's leaves is affected.
+     *
+     * This makes the emulator stop volunteering that it is an emulator; it does not
+     * weaken or disable anything the guest checks. */
     constexpr uint32_t HypervisorBase = 0x4000'0000;
     if (Function >= HypervisorBase && Function < (HypervisorBase + Hypervisor.size())) {
+      if (HideHypervisorBit()) {
+        return {};
+      }
       const auto Handler = Hypervisor[Function - HypervisorBase];
       return (this->*Handler)(Leaf);
     }

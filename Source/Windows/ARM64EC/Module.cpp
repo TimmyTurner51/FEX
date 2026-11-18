@@ -2286,8 +2286,62 @@ static void IosTiLog(const char* msg) {
 }
 #endif
 
+#ifdef FEX_IOS_HOST
+/* ml1294: prove which stage clears EmulatorData[0], through a channel that lands.
+ *
+ * EmulatorData[0] is the CpuStateFrame and must survive from ThreadInit to the
+ * first emulated instruction. On the Madeira Dock fault it does not: the same
+ * CPU area reads StateFrame(ED0)=0x7c00801140 right after ThreadInit and
+ * ED0=0x0 at the SEGV, while ED1..ED3 are still intact. That is case (b) of
+ * IosLogCPUArea's taxonomy -- initialised, then clobbered -- and a zeroed frame
+ * is exactly what makes the next stack store compute 0-0x390 and fault at
+ * 0xfffffffffffffc70.
+ *
+ * The only deliberate writers of that field are ThreadInit's two failure paths,
+ * and both log already -- but through LogMan::EFmt with no thread or area in the
+ * message, so they could not be matched to a fault and were never checked. Log
+ * the whole area with the tid at every stage on that path instead, and make the
+ * two failure paths print the call-ret stack's occupancy, since 11073% of 4MB
+ * was measured at the fault and CallRetStack::InitializeThread is what turns
+ * that into STATUS_NO_MEMORY.
+ *
+ * Uses LogMan (reaches madeira-log.txt, as [caspal128] proved) and never the
+ * WriteFile(hStdError) / raw write(2) paths -- ml1216/ml1217 measured those as
+ * dead, so their silence means nothing. */
+static void IosCpuAreaState(const char* tag) {
+  uintptr_t tpidrro;
+  __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tpidrro));
+  void* tsd275 = IosTebTsdOffset
+                     ? *reinterpret_cast<void**>((tpidrro & ~uintptr_t(7)) + IosTebTsdOffset)
+                     : nullptr;
+  _TEB* teb = IOSLoadTEB();
+  auto* area = teb ? *reinterpret_cast<CHPE_V2_CPU_AREA_INFO**>(
+                         reinterpret_cast<uintptr_t>(teb) + ThreadCPUArea::TEBCPUAreaOffset)
+                   : nullptr;
+  uint64_t ed0 = 0, ed1 = 0, ed2 = 0, ed3 = 0;
+  if (area) {
+    ed0 = reinterpret_cast<uintptr_t>(area->EmulatorData[0]);
+    ed1 = reinterpret_cast<uintptr_t>(area->EmulatorData[1]);
+    ed2 = reinterpret_cast<uintptr_t>(area->EmulatorData[2]);
+    ed3 = reinterpret_cast<uintptr_t>(area->EmulatorData[3]);
+  }
+  /* ml1296: EFmt, matching IosLogCPUArea -- that one is [cpu-area] in the log,
+   * so EFmt is the channel that provably works from this module and DFmt is the
+   * no-op. ml1294/ml1295 tried DFmt in both directions and printed nothing. */
+  LogMan::Msg::EFmt("[area-state] {} tid={:#x} teb={} tsd275={} area={} "
+                    "ED0={} ED1={} ED2={} ED3={}",
+                    tag, (unsigned long long)GetCurrentThreadId(),
+                    (void*)teb, tsd275, (void*)area,
+                    area ? area->EmulatorData[0] : nullptr,
+                    area ? area->EmulatorData[1] : nullptr,
+                    area ? area->EmulatorData[2] : nullptr,
+                    area ? area->EmulatorData[3] : nullptr);
+}
+#endif
+
 NTSTATUS ThreadInit() {
 #ifdef FEX_IOS_HOST
+  IosCpuAreaState("init-enter");
   /* iOS-Madeira diagnostic: log entry to thread-init so we can confirm Wine
    * is calling BTCpu64ThreadInit for the main x86_64 thread before the
    * dispatcher is invoked. Without this, EmulatorData[0] is garbage and
@@ -2331,6 +2385,7 @@ NTSTATUS ThreadInit() {
      * report it rather than wedging on a lock owned by a dead thread. */
     LogMan::Msg::EFmt("[FEX-iOS] ThreadInit: thread state unavailable -- unwinding thread {:#x} "
                       "and returning STATUS_NO_MEMORY", (unsigned long long)GetCurrentThreadId());
+    IosCpuAreaState("fail-nostate");
     CPUArea.StateFrame() = nullptr;
     CPUArea.EmulatorStackLimit() = 0;
     CPUArea.EmulatorStackBase() = 0;
@@ -2404,7 +2459,12 @@ NTSTATUS ThreadInit() {
 #endif
 
   if (!FEX::Windows::CallRetStack::InitializeThread(Thread)) {
-    /* Unwind everything this function built for this thread, in reverse.
+    /* ml1294: this is the guard that clears EmulatorData[0], so report what the
+     * call-ret stack actually looked like when it refused. A 4MB window with
+     * 11073% reported at the fault is either an exhausted stack or an entry
+     * pointer far outside it, and the two need different fixes.
+     *
+     * Unwind everything this function built for this thread, in reverse.
      *
      * Returning early without unwinding leaves the CPU area pointing at a
      * half-built thread, and the emulator stack and segment table leaked -- on
@@ -2416,6 +2476,7 @@ NTSTATUS ThreadInit() {
                       "-- unwinding thread {:#x} and returning STATUS_NO_MEMORY",
                       (unsigned long long)ios_fex_band_base, (unsigned long long)ios_fex_band_end,
                       (unsigned long long)GetCurrentThreadId());
+    IosCpuAreaState("fail-callret");
 #else
     LogMan::Msg::EFmt("ThreadInit: call-ret stack unavailable -- unwinding thread {:#x} and returning STATUS_NO_MEMORY",
                       (unsigned long long)GetCurrentThreadId());
@@ -2455,6 +2516,9 @@ NTSTATUS ThreadInit() {
   Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
 #endif
   CPUArea.StateFrame() = Thread->CurrentFrame;
+#ifdef FEX_IOS_HOST
+  IosCpuAreaState("init-set");
+#endif
 
   uint64_t EnterEC = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterEC;
   CPUArea.DispatcherLoopTopEnterEC() = EnterEC;
@@ -2650,6 +2714,15 @@ NTSTATUS ThreadInit() {
       }
       log_hex("[FEX-iOS]   scan-patched broken sites: count=", (uint64_t)patched);
       log_hex("[FEX-iOS]   scan-skipped already-ok pair-0 sites: count=", (uint64_t)already_ok);
+      /* ml1296: EFmt (IosLogCPUArea's channel, which reaches the log), not
+       * log_hex and not DFmt. If this reads patched=0 already_ok=0, the
+       * dispatcher contains no SpillStaticRegs site at all and RSP can never be
+       * spilled -- which is what a zero gregs[RSP] at the first emulated block
+       * means.
+       *
+       * The loop above still uses the no-op log_hex; harmless, left alone. */
+      LogMan::Msg::EFmt("[dispatcher-patch] enterEC={} scan-bytes={} patched={} already_ok={}",
+                        (void*)EnterEC, (unsigned long long)kScanBytes, patched, already_ok);
     }
 
     log_hex("[FEX-iOS] DispatcherPatch DONE.", 0);
