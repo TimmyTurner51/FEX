@@ -2365,6 +2365,12 @@ NTSTATUS ThreadInit() {
   FEX::Windows::InitCRTThread();
 #ifdef FEX_IOS_HOST
   IosTiLog("[FEX-iOS] TI:crt\n");
+  /* ml1297: the first checkpoint that is guaranteed to be observable. EFmt reaches the log
+   * only if MFmtImpl's allocator probe succeeds, and it drops the message silently when it
+   * does not -- so init-enter, which runs before InitCRTThread, can still vanish. This one
+   * runs after the CRT is up, so a missing init-post-crt now means ThreadInit was genuinely
+   * not entered, rather than that the logger ate it. */
+  IosCpuAreaState("init-post-crt");
 #endif
   const auto CPUArea = GetCPUArea();
 
