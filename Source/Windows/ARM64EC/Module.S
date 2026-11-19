@@ -146,7 +146,10 @@ IosJitGateMsg:
 .data
 .globl IosJitGateSave
 IosJitGateSave:
-  .space 56
+  .space 64
+.globl IosJitGateOnce
+IosJitGateOnce:
+  .byte 0
 .text
 
 // Stamp the route tag. x16/x17 are IP0/IP1: dead at every call boundary and
@@ -811,6 +814,19 @@ enter_jit:
   // the gate reports in every case it was built for. Single slot, so a racing
   // thread could lose a value on this diagnostic path only -- acceptable against
   // never reporting at all.
+  //
+  // ml1302: report once. This printed 295,583 lines in four minutes -- a write(2)
+  // per JIT entry, 5.9 MB of log, and a syscall in the path of everything the
+  // game does. That overhead is itself capable of turning a slow load into a
+  // stalled one. The first entry carries the route tag, which is the whole point;
+  // a later different route can be recovered by bumping the rev. After the first
+  // entry the cost is three instructions.
+  adrp x16, IosJitGateOnce
+  add x16, x16, #:lo12:IosJitGateOnce
+  ldrb w17, [x16]
+  cbnz w17, 702f                  // already reported once: pass straight through
+  mov w17, #1
+  strb w17, [x16]
   adrp x16, IosJitGateSave
   add x16, x16, #:lo12:IosJitGateSave
   str x0, [x16]
@@ -821,6 +837,7 @@ enter_jit:
   str x5, [x16, #40]
   mov x17, sp                     // SP cannot be a store source; copy it out
   str x17, [x16, #48]             // record the SP we were handed, for the log
+  str x9, [x16, #56]              // and the target the dispatcher asked for
   adrp x1, IosJitGateMsg
   add x1, x1, #:lo12:IosJitGateMsg
   mov x0, #2                      // fd 2
