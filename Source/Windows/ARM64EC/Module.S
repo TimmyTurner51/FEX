@@ -138,6 +138,17 @@ IosJitGateMsg:
   .byte 0x0a                      // offset 13: newline
 .text
 
+// ml1301: enter_jit's spill area. Kept out of .text' writable neighbour on purpose:
+// the gate must survive a caller that hands it a dead or misaligned SP, and storing
+// through SP is what faulted (BUS_ADRALN at enter_jit+0x34). x0-x5 plus the SP we
+// were given; [48] is the raw SP for the log.
+.balign 8
+.data
+.globl IosJitGateSave
+IosJitGateSave:
+  .space 56
+.text
+
 // Stamp the route tag. x16/x17 are IP0/IP1: dead at every call boundary and
 // unused by the tail of each route below.
 .macro IOS_SET_GATE imm
@@ -791,39 +802,39 @@ enter_jit:
   // describe: when SP is not plausible, send the route tag from registers only and
   // skip the spill, letting the real fault happen instead of this one. x0-x2 are
   // clobbered on that path, which is acceptable because execution is already lost.
-  cmp sp, #0x1000
-  b.hs 701f
-  adrp x16, IosJitGateMsg
-  add x16, x16, #:lo12:IosJitGateMsg
-  mov w17, #0x39                  // '9' = enter_jit reached with a dead SP
-  strb w17, [x16, #12]
-  mov x1, x16
-  mov x0, #2                      // fd 2
-  mov x2, #14                     // "\n[jit-gate] 9\n"
-  mov w16, #4                     // syscall 4 == write
-  svc #0x80
-  b 702f                          // no stack to spill to: fall through to the real fault
-701:
-  sub sp, sp, #0x40
-  str x0, [sp]
-  str x1, [sp, #8]
-  str x2, [sp, #16]
-  str x3, [sp, #24]
-  str x4, [sp, #32]
-  str x5, [sp, #40]
+  //
+  // ml1301: the guarded run showed the fault was BUS_ADRALN, not a null address --
+  // si_code=1, `str x0,[sp]` at enter_jit+0x34. SP is a real stack but is only
+  // 4-byte aligned, which ARM64 stores do not allow (a 32-bit x86 caller can hand
+  // us sp at 4 mod 8). Any spill through SP is therefore unsafe, whatever the
+  // address. Save to a static slot instead: no stack, no alignment dependence, and
+  // the gate reports in every case it was built for. Single slot, so a racing
+  // thread could lose a value on this diagnostic path only -- acceptable against
+  // never reporting at all.
+  adrp x16, IosJitGateSave
+  add x16, x16, #:lo12:IosJitGateSave
+  str x0, [x16]
+  str x1, [x16, #8]
+  str x2, [x16, #16]
+  str x3, [x16, #24]
+  str x4, [x16, #32]
+  str x5, [x16, #40]
+  mov x17, sp                     // SP cannot be a store source; copy it out
+  str x17, [x16, #48]             // record the SP we were handed, for the log
   adrp x1, IosJitGateMsg
   add x1, x1, #:lo12:IosJitGateMsg
   mov x0, #2                      // fd 2
   mov x2, #14                     // "\n[jit-gate] X\n"
   mov w16, #4                     // syscall 4 == write
   svc #0x80
-  ldr x0, [sp]
-  ldr x1, [sp, #8]
-  ldr x2, [sp, #16]
-  ldr x3, [sp, #24]
-  ldr x4, [sp, #32]
-  ldr x5, [sp, #40]
-  add sp, sp, #0x40
+  adrp x16, IosJitGateSave
+  add x16, x16, #:lo12:IosJitGateSave
+  ldr x0, [x16]
+  ldr x1, [x16, #8]
+  ldr x2, [x16, #16]
+  ldr x3, [x16, #24]
+  ldr x4, [x16, #32]
+  ldr x5, [x16, #40]
 702:
   IOS_LOAD_TEB x17
   ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
