@@ -1125,26 +1125,66 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0004h(uint32_t Leaf) con
   return Function_8000_0004h(Leaf, CurrentCPUIndex());
 }
 
+// MADEIRA ml1303: leaves 0 and 1 announce an x86 vendor and family (GenuineIntel /
+// Skylake, or AuthenticAMD / Zen+), but the brand-string leaves returned the host's
+// own ARM core name -- "Apple Avalanche (M2 Max)" on this device. A guest comparing
+// the two sees a processor that cannot exist, so allow the brand to be overridden to
+// something coherent with the vendor the guest is already being told.
+const char *CPUIDEmu::GetBrandString(uint32_t CPU) const {
+  static const fextl::string Override = fextl::string {CpuBrand()};
+
+  if (!Override.empty()) {
+    return Override.c_str();
+  }
+
+  return PerCPUData[CPU].ProductName;
+}
+
+void CPUIDEmu::NoteGuestLeaf(uint32_t Function, uint32_t Leaf) const {
+  static const bool Enabled = []() {
+    const char *Value = getenv("FEX_LOG_CPUID_LEAVES");
+    return Value && Value[0] && Value[0] != '0';
+  }();
+
+  if (!Enabled) {
+    return;
+  }
+
+  static uint32_t Seen[64] {};
+  static size_t SeenCount {};
+
+  for (size_t i = 0; i < SeenCount; ++i) {
+    if (Seen[i] == Function) {
+      return;
+    }
+  }
+
+  if (SeenCount < (sizeof(Seen) / sizeof(Seen[0]))) {
+    Seen[SeenCount++] = Function;
+    LogMan::Msg::EFmt("[cpuid-read] ml1303 function={:#x} leaf={:#x} distinct={}", Function, Leaf, SeenCount);
+  }
+}
+
 FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0002h(uint32_t Leaf, uint32_t CPU) const {
   FEXCore::CPUID::FunctionResults Res {};
-  auto& Data = PerCPUData[CPU];
-  memcpy(&Res, Data.ProductName, std::min(strlen(Data.ProductName), sizeof(FEXCore::CPUID::FunctionResults)));
+  const char *Name = GetBrandString(CPU);
+  memcpy(&Res, Name, std::min(strlen(Name), sizeof(FEXCore::CPUID::FunctionResults)));
   return Res;
 }
 
 FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0003h(uint32_t Leaf, uint32_t CPU) const {
   FEXCore::CPUID::FunctionResults Res {};
-  auto& Data = PerCPUData[CPU];
-  const auto RemainingStringSize = std::max<ssize_t>(0, strlen(Data.ProductName) - 16);
-  memcpy(&Res, Data.ProductName + 16, std::min<size_t>(RemainingStringSize, sizeof(FEXCore::CPUID::FunctionResults)));
+  const char *Name = GetBrandString(CPU);
+  const auto RemainingStringSize = std::max<ssize_t>(0, strlen(Name) - 16);
+  memcpy(&Res, Name + 16, std::min<size_t>(RemainingStringSize, sizeof(FEXCore::CPUID::FunctionResults)));
   return Res;
 }
 
 FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0004h(uint32_t Leaf, uint32_t CPU) const {
   FEXCore::CPUID::FunctionResults Res {};
-  auto& Data = PerCPUData[CPU];
-  const auto RemainingStringSize = std::max<ssize_t>(0, strlen(Data.ProductName) - 32);
-  memcpy(&Res, Data.ProductName + 32, std::min<size_t>(RemainingStringSize, sizeof(FEXCore::CPUID::FunctionResults)));
+  const char *Name = GetBrandString(CPU);
+  const auto RemainingStringSize = std::max<ssize_t>(0, strlen(Name) - 32);
+  memcpy(&Res, Name + 32, std::min<size_t>(RemainingStringSize, sizeof(FEXCore::CPUID::FunctionResults)));
   return Res;
 }
 

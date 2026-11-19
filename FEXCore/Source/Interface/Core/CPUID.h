@@ -37,6 +37,8 @@ public:
   constexpr static uint64_t CACHELINE_SIZE = 64;
 
   FEXCore::CPUID::FunctionResults RunFunction(uint32_t Function, uint32_t Leaf) const {
+    NoteGuestLeaf(Function, Leaf);
+
     if (Function < Primary.size()) {
       const auto Handler = Primary[Function];
       return (this->*Handler)(Leaf);
@@ -148,6 +150,15 @@ private:
   bool Hybrid {};
   uint32_t Cores {};
   FEX_CONFIG_OPT(HideHypervisorBit, HIDEHYPERVISORBIT);
+  FEX_CONFIG_OPT(CpuBrand, CPUBRAND);
+
+  // Returns the processor brand string the guest should see for CPU `CPU`.
+  const char *GetBrandString(uint32_t CPU) const;
+
+  // MADEIRA ml1303: records which CPUID leaves the guest actually requests, so a title
+  // that declines to run can be checked for identity probing instead of guessed at.
+  // No-op unless FEX_LOG_CPUID_LEAVES is set.
+  void NoteGuestLeaf(uint32_t Function, uint32_t Leaf) const;
 
   // XFEATURE_ENABLED_MASK
   // Mask that configures what features are enabled on the CPU.

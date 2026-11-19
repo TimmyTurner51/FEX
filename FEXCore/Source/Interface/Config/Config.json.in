@@ -542,6 +542,17 @@
           "Should only be used for applications that have issues with this set."
         ]
       },
+      "CpuBrand": {
+        "Type": "str",
+        "Default": "",
+        "Desc": [
+          "Overrides the processor brand string (CPUID 0x80000002..4).",
+          "By default the host's own ARM core name is reported (for example",
+          "'Apple Avalanche (M2 Max)') while leaves 0 and 1 announce an x86",
+          "vendor and family. Set this to an x86 brand of the same class to keep",
+          "the two leaves consistent."
+        ]
+      },
       "StartupSleep": {
         "Type": "uint32",
         "Default": "0",
