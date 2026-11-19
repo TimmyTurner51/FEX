@@ -783,6 +783,27 @@ enter_jit:
   // showed BUS_ADRALN on this very instruction, a9bd07e0 at enter_jit+0.
   // Plain 8-byte str/ldr and a `sub sp` (which has no alignment requirement)
   // work whatever alignof(sp-16) is, and the frame is restored exactly.
+  //
+  // ml1300: that fix still assumed SP pointed at a real stack. FH6's dockhost.exe
+  // reaches here with SP=0x48 -- the `str x30,[sp,#-8]!` above and this `sub` take
+  // it to 0, and the spill then faults on address 0. The gate exists to report
+  // exactly this kind of breakage, so it must not die on the stack it is about to
+  // describe: when SP is not plausible, send the route tag from registers only and
+  // skip the spill, letting the real fault happen instead of this one. x0-x2 are
+  // clobbered on that path, which is acceptable because execution is already lost.
+  cmp sp, #0x1000
+  b.hs 701f
+  adrp x16, IosJitGateMsg
+  add x16, x16, #:lo12:IosJitGateMsg
+  mov w17, #0x39                  // '9' = enter_jit reached with a dead SP
+  strb w17, [x16, #12]
+  mov x1, x16
+  mov x0, #2                      // fd 2
+  mov x2, #14                     // "\n[jit-gate] 9\n"
+  mov w16, #4                     // syscall 4 == write
+  svc #0x80
+  b 702f                          // no stack to spill to: fall through to the real fault
+701:
   sub sp, sp, #0x40
   str x0, [sp]
   str x1, [sp, #8]
@@ -803,6 +824,7 @@ enter_jit:
   ldr x4, [sp, #32]
   ldr x5, [sp, #40]
   add sp, sp, #0x40
+702:
   IOS_LOAD_TEB x17
   ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
 #else
