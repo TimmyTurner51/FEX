@@ -363,6 +363,31 @@ DEF_OP(Yield) {
   yield();
 }
 
+// FH6Yield experiment, parked. The emitter body is here, but Op_FH6Yield has no
+// declaration in JITClass.h and no opcode/IR entry, so the tree does not compile with it
+// enabled. Restore this together with the declaration, the IROps entry and the frontend
+// lowering that emits it.
+//
+// #if defined(_WIN32)
+// extern "C" __declspec(dllimport) long NtYieldExecution(void);
+// static void FH6Deschedule() {
+//   NtYieldExecution();
+// }
+// #endif
+//
+// DEF_OP(FH6Yield) {
+// #if defined(ARCHITECTURE_arm64ec)
+//   PushDynamicRegs(TMP1);
+//   SpillStaticRegs(TMP1);
+//   LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r4, reinterpret_cast<uint64_t>(&FH6Deschedule));
+//   blr(ARMEmitter::Reg::r4);
+//   FillStaticRegs();
+//   PopDynamicRegs();
+// #else
+//   yield();
+// #endif
+// }
+
 DEF_OP(MonoBackpatcherWrite) {
   auto Op = IROp->C<IR::IROp_MonoBackpatcherWrite>();
 
